@@ -33,7 +33,7 @@ params:
   load_checkpoint: false
   load_path: ""
   config:
-    name: grasp_visual_servo_rgbd
+    name: grasp_visual_servo_rgbd_multipart
     env_name: rlgpu
     device: cuda:0
     device_name: cuda:0
@@ -50,11 +50,10 @@ params:
     learning_rate: 5.0e-5
     lr_schedule: linear
     kl_threshold: 0.012
-    # Stop training via max_epochs, not a single high-return episode.
     score_to_win: 1000000000.0
-    max_epochs: 2000
-    save_best_after: 20
-    save_frequency: 50
+    max_epochs: 10000
+    save_best_after: 50
+    save_frequency: 100
     print_stats: True
     grad_norm: 0.5
     entropy_coef: 0.0

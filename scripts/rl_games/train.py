@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import sys
 from distutils.util import strtobool
 
@@ -63,16 +64,16 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import logging
-import math
 import os
 import random
 import time
 from datetime import datetime
 
 import gymnasium as gym
-from rl_games.common import env_configurations, vecenv
+from rl_games.common import a2c_common, env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
+from tensorboardX import SummaryWriter
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -94,6 +95,46 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 logger = logging.getLogger(__name__)
 
 import isaac_rl.tasks  # noqa: F401
+from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (
+    register_grasp_completion_runner,
+)
+
+
+class EssentialSummaryWriter(SummaryWriter):
+    """Keep TensorBoard focused on diagnostics needed for this task."""
+
+    _allowed_scalars = {
+        "performance/step_inference_rl_update_fps",
+        "losses/a_loss",
+        "losses/c_loss",
+        "losses/cval_loss",
+        "losses/entropy",
+        "losses/bounds_loss",
+        "losses/pose_aux_loss",
+        "losses/completion_aux_loss",
+        "info/last_lr",
+        "info/kl",
+        "rewards/iter",
+        "episode_lengths/iter",
+    }
+
+    def add_scalar(self, tag, scalar_value, global_step=None, walltime=None, **kwargs):
+        if tag == "losses/completion_probability_mean":
+            return super().add_scalar(
+                "diagnostics/completion_probability_mean",
+                scalar_value,
+                global_step,
+                walltime,
+                **kwargs,
+            )
+        if tag in self._allowed_scalars or tag.startswith("Episode/"):
+            return super().add_scalar(tag, scalar_value, global_step, walltime, **kwargs)
+        return None
+
+
+# RL-Games otherwise writes duplicate step/iteration/time variants for rewards
+# and episode length, plus several redundant timing and scheduler plots.
+a2c_common.SummaryWriter = EssentialSummaryWriter
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -211,6 +252,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set number of actors into agent config
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+    # RL-Games requires the rollout batch to be exactly divisible by the
+    # minibatch size. Keep the large configured minibatch for normal parallel
+    # runs, but reduce it to the greatest valid divisor for smoke/small runs.
+    train_cfg = agent_cfg["params"]["config"]
+    rollout_batch_size = env.unwrapped.num_envs * train_cfg["horizon_length"]
+    configured_minibatch_size = train_cfg["minibatch_size"]
+    minibatch_size = math.gcd(rollout_batch_size, configured_minibatch_size)
+    train_cfg["minibatch_size"] = minibatch_size
+    if "central_value_config" in train_cfg:
+        train_cfg["central_value_config"]["minibatch_size"] = minibatch_size
+    print(
+        f"[INFO] RL-Games rollout batch={rollout_batch_size}, "
+        f"minibatch={minibatch_size} ({env.unwrapped.num_envs} environments)."
+    )
     # create runner from rl-games
 
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
@@ -219,6 +274,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         runner = Runner(IsaacAlgoObserver())
 
+    register_grasp_completion_runner(runner)
     runner.load(agent_cfg)
 
     # reset the agent and env
