@@ -393,3 +393,6 @@ cd isaac_rl
 
 SAC writes independent logs and checkpoints under `logs/asymmetric_sac/`; it
 does not change the PPO task configuration, checkpoint format, or entry point.
+On the current local 570-series NVIDIA driver, `run.sh` automatically disables
+the incompatible cuDNN path. It leaves cuDNN enabled on Euler's 580-series
+driver unless `ISAAC_RL_DISABLE_CUDNN` is explicitly set.
