@@ -35,7 +35,7 @@ docker/.container.cfg
 !.vscode
 
 # Outputs
-/data/
+/data
 **/output/*
 **/outputs/*
 **/videos/*
@@ -64,9 +64,6 @@ _build
 
 # Teleop Recorded Dataset
 /datasets/
-
-# Tests
-tests/
 
 # Docker history
 .isaac-lab-docker-history

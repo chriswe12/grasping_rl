@@ -19,6 +19,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.isaac_rl_env_cfg:GraspVisualServoEnvCfg",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "asymmetric_sac_cfg_entry_point": f"{agents.__name__}:asymmetric_sac_cfg.yaml",
     },
 )
 
@@ -32,6 +33,9 @@ gym.register(
         ),
         "rl_games_cfg_entry_point": (
             f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
+        ),
+        "asymmetric_sac_cfg_entry_point": (
+            f"{agents.__name__}:asymmetric_sac_cfg.yaml"
         ),
     },
 )
@@ -47,6 +51,9 @@ gym.register(
         "rl_games_cfg_entry_point": (
             f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
         ),
+        "asymmetric_sac_cfg_entry_point": (
+            f"{agents.__name__}:asymmetric_sac_cfg.yaml"
+        ),
     },
 )
 
@@ -57,5 +64,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.isaac_rl_env_cfg:GraspVisualServoEnvCfg_PLAY",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "asymmetric_sac_cfg_entry_point": f"{agents.__name__}:asymmetric_sac_cfg.yaml",
     },
 )

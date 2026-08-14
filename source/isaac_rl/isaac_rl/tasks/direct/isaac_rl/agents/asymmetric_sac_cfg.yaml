@@ -1,0 +1,44 @@
+seed: 42
+name: grasp_visual_servo_rgbd_multipart_asymmetric_sac
+device: cuda:0
+
+actor:
+  pretrained: true
+  geometry_feature_size: 128
+  log_std_min: -5.0
+  log_std_max: 2.0
+
+critic:
+  state_size: 26
+  action_size: 6
+
+algorithm:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3.0e-4
+  critic_learning_rate: 3.0e-4
+  alpha_learning_rate: 3.0e-4
+  initial_temperature: 0.10
+  target_entropy: -6.0
+  gradient_norm: 1.0
+  pose_loss_weight: 0.20
+  completion_loss_weight: 0.20
+  completion_positive_weight: 3.0
+
+replay:
+  # About 5.64 GiB at this capacity. Live RGB is uint8, normalized depth is
+  # quantized 16-bit values, and canonical goals use only catalog indices.
+  capacity: 65536
+  batch_size: 256
+  minimum_size: 8192
+  random_steps: 8192
+  # One replay sample per newly collected transition. With 64 environments
+  # and batch_size=256, this performs one gradient update every four steps.
+  update_to_data_ratio: 1.0
+  pin_memory: false
+
+training:
+  total_transitions: 2000000
+  log_interval_transitions: 10000
+  checkpoint_interval_transitions: 100000
+  deterministic_collection: false

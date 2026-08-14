@@ -357,3 +357,39 @@ split may be changed explicitly to inspect validation or training targets:
 Evaluation reports aggregate, per-part, per-orientation, and per-target errors
 and success. Use validation while selecting a checkpoint and run test only for
 the final held-out result.
+
+## Asymmetric SAC experiment
+
+The SAC implementation is separate from the RL-Games PPO path. Its actor sees
+only the deployable `72x128x8` live/goal RGB-D tensor and the previous 6D
+motion command. Twin Q critics see the privileged 26D state (`q`, `qd`, 6D
+pose error, previous motion) plus the current 6D motion action. Pose error and
+completion are supervised actor heads; completion probability is appended as
+the environment's seventh, deterministic stop-gate input and is not treated as
+a continuous SAC action.
+
+Replay stays in CPU memory. Live RGB is `uint8`, normalized live depth is
+offset-quantized 16-bit values, low-dimensional tensors are `float16`, and canonical goal images are
+recovered from one shared catalog using stored target indices. The default
+65,536-transition replay allocates about 5.64 GiB instead of hundreds of GiB for
+full float32 live/goal observations.
+
+The default update-to-data ratio is 1.0. At 64 environments and batch size 256,
+one SAC update runs every four vector steps, keeping visual-encoder work per
+collected transition close to the current two-mini-epoch PPO setup.
+
+```bash
+cd isaac_rl
+
+# Four transitions, one gradient update, and a checkpoint.
+./run.sh sac-smoke
+
+# 64 environments and two million collected transitions.
+./run.sh sac-train 64 2000000
+
+# Deterministic held-out playback.
+./run.sh sac-play logs/asymmetric_sac/<run>/checkpoints/final.pt 20
+```
+
+SAC writes independent logs and checkpoints under `logs/asymmetric_sac/`; it
+does not change the PPO task configuration, checkpoint format, or entry point.
