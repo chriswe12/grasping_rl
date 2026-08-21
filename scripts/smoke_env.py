@@ -1,6 +1,14 @@
 """Run a bounded reset/step smoke test for the grasp visual-servo task."""
 
 import argparse
+import sys
+from pathlib import Path
+
+# Keep the external project importable when this file is launched directly by
+# Isaac Sim. Python otherwise puts only isaac_rl/scripts on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from isaaclab.app import AppLauncher
 
@@ -27,6 +35,22 @@ parser.add_argument(
     action="store_true",
     help="After the zero-action hold, send one explicit completion action.",
 )
+parser.add_argument(
+    "--sim2real-profile",
+    choices=(
+        "nominal",
+        "sensor_only",
+        "camera_uncertainty",
+        "timing_control",
+        "appearance",
+        "combined_sim2real",
+        "combined_clutter",
+        "combined_depth_robust",
+        "stress_test",
+    ),
+    default=None,
+    help="Apply one full-strength named profile for runtime diagnostics.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -35,6 +59,7 @@ app = AppLauncher(args).app
 import gymnasium as gym
 import isaac_rl.tasks  # noqa: F401,E402
 import torch
+from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
 
 from isaaclab_tasks.utils import parse_env_cfg
 
@@ -47,6 +72,12 @@ cfg = parse_env_cfg(
     num_envs=args.num_envs,
 )
 cfg.seed = 7
+if args.sim2real_profile is not None:
+    profile = apply_sim2real_profile(cfg, args.sim2real_profile)
+    # A smoke test must exercise the selected profile immediately instead of
+    # waiting through the normal training curriculum warmup.
+    cfg.training_curriculum_enabled = False
+    print(f"[SMOKE] sim2real_profile={profile.identifier}", flush=True)
 if args.positive_completion_resets:
     # Bypass the training mixture so this diagnostic remains deterministic.
     cfg.training_reset_mixture_enabled = False
@@ -57,6 +88,31 @@ observation, _ = env.reset()
 print(
     f"[SMOKE] policy={tuple(observation['policy'].shape)} "
     f"critic={tuple(observation['critic'].shape)} action={env.action_space.shape}",
+    flush=True,
+)
+print(
+    f"[SMOKE] observation_delay_steps={env.unwrapped.live_observation_delay_steps.detach().cpu().tolist()} "
+    f"action_delay_steps={env.unwrapped.motion_action_delay_steps.detach().cpu().tolist()} "
+    f"response_scale={env.unwrapped.motion_response_scale.flatten().detach().cpu().tolist()} "
+    f"stiffness_scale={env.unwrapped.physics_joint_stiffness_scale.flatten().detach().cpu().tolist()} "
+    f"damping_scale={env.unwrapped.physics_joint_damping_scale.flatten().detach().cpu().tolist()}",
+    flush=True,
+)
+if env.unwrapped.live_workspace_appearance_randomizer is not None:
+    workspace = env.unwrapped.live_workspace_appearance_randomizer
+    layout_names = [variant.name for variant in env.unwrapped.tslot_visual_bindings["variants"]]
+    print(
+        f"[SMOKE] part_palette_indices={workspace.part_palette_index.detach().cpu().tolist()} "
+        f"tslot_background_indices={workspace.background_index.detach().cpu().tolist()} "
+        f"tslot_layouts={layout_names} "
+        f"collision_surface={env.unwrapped.tslot_visual_bindings['collision_surface']}",
+        flush=True,
+    )
+clutter = env.unwrapped.clutter_visual_bindings
+print(
+    f"[SMOKE] clutter_profile={clutter['profile']} "
+    f"clutter_active_environments={clutter['active_environment_count']}/{env.unwrapped.num_envs} "
+    f"clutter_objects={len(clutter['prim_paths'])}",
     flush=True,
 )
 target_indices = env.unwrapped.target_index.detach().cpu().tolist()

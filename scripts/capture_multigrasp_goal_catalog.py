@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -58,6 +59,19 @@ parser.add_argument(
     type=Path,
     default=Path("isaac_rl/data/multigrasp_goal_exclusions.json"),
 )
+parser.add_argument(
+    "--target-indices",
+    type=int,
+    nargs="+",
+    default=None,
+    help="Capture only these zero-based source target indices (diagnostic use).",
+)
+parser.add_argument(
+    "--contact-sheet",
+    type=Path,
+    default=None,
+    help="Optional PNG contact sheet of the rendered diagnostic targets.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
@@ -95,6 +109,10 @@ from grasp_planning.isaac_visual_scene import (  # noqa: E402
 )
 from grasp_planning.planning.fr3_motion_context import FR3MotionContext  # noqa: E402
 from grasp_planning.start_poses import KUKA_Y_GRIPPER_APPROACH_PROFILE  # noqa: E402
+from grasp_planning.visual_servo_workspace import (  # noqa: E402
+    VISUAL_SERVO_TSLOT_PROFILE,
+    spawn_visual_servo_tslot_surfaces,
+)
 from isaac_rl.tasks.direct.isaac_rl.multigrasp_catalog import (  # noqa: E402
     load_multigrasp_catalog,
 )
@@ -128,7 +146,62 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def main() -> None:
+def _select_targets(payload: dict[str, np.ndarray], indices: np.ndarray) -> dict[str, np.ndarray]:
+    """Return a self-consistent target subset while preserving per-part metadata."""
+
+    source_target_count = len(payload["target_ids"])
+    selected: dict[str, np.ndarray] = {}
+    for name, value in payload.items():
+        if value.ndim >= 1 and value.shape[0] == source_target_count:
+            selected[name] = value[indices].copy()
+        else:
+            selected[name] = value.copy()
+    return selected
+
+
+def _resolve_catalog_asset_path(value: str | Path) -> Path:
+    """Resolve a catalogue asset both on the authoring host and in Docker."""
+
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    # Multipart assets retain absolute authoring-host paths.  Their suffix
+    # starts at isaac_rl/, which is stable inside the project bind mount.
+    parts = candidate.parts
+    try:
+        project_relative = Path(*parts[parts.index("isaac_rl") :])
+    except ValueError:
+        return candidate.resolve()
+    remapped = REPO_ROOT / project_relative
+    return remapped.resolve()
+
+
+def _write_contact_sheet(*, path: Path, rgb: np.ndarray, target_ids: np.ndarray) -> None:
+    """Write a small human-reviewable sheet without changing catalogue pixels."""
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    columns = min(4, len(rgb))
+    tile_width, tile_height = 384, 216
+    label_height = 32
+    rows = int(math.ceil(len(rgb) / columns))
+    sheet = Image.new("RGB", (columns * tile_width, rows * (tile_height + label_height)), (20, 23, 28))
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+    for index, image in enumerate(rgb):
+        col, row = index % columns, index // columns
+        x, y = col * tile_width, row * (tile_height + label_height)
+        tile = Image.fromarray(image).resize((tile_width, tile_height), Image.Resampling.LANCZOS)
+        sheet.paste(tile, (x, y))
+        draw.text((x + 8, y + tile_height + 7), str(target_ids[index]), fill=(240, 242, 245), font=font)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path)
+
+
+def main() -> None:  # noqa: C901
     if args_cli.settle_steps < 1:
         raise ValueError("--settle-steps must be positive.")
     if args_cli.batch_size < 1:
@@ -140,6 +213,16 @@ def main() -> None:
             raise FileNotFoundError(required_path)
     with np.load(paths_asset, allow_pickle=False) as source:
         payload = {name: source[name].copy() for name in source.files}
+    source_target_count = len(payload["target_ids"])
+    if args_cli.target_indices is not None:
+        selected_indices = np.asarray(args_cli.target_indices, dtype=np.int64)
+        if selected_indices.size == 0 or np.unique(selected_indices).size != selected_indices.size:
+            raise ValueError("--target-indices must contain one or more unique indices.")
+        if int(selected_indices.min()) < 0 or int(selected_indices.max()) >= source_target_count:
+            raise ValueError(
+                f"--target-indices must be in [0, {source_target_count - 1}], got {selected_indices.tolist()}."
+            )
+        payload = _select_targets(payload, selected_indices)
     target_count = len(payload["target_ids"])
     if target_count < 1 or not bool(np.all(payload["moveit_plan_validated"])):
         raise ValueError(
@@ -162,7 +245,7 @@ def main() -> None:
         )
     if "part_usd_paths" in payload:
         part_usds = tuple(
-            Path(str(value)).expanduser().resolve()
+            _resolve_catalog_asset_path(str(value))
             for value in payload["part_usd_paths"].tolist()
         )
     else:
@@ -233,12 +316,22 @@ def main() -> None:
             height=VISUAL_SERVO_RENDER_HEIGHT,
         )
     )
+    tslot_bindings = spawn_visual_servo_tslot_surfaces(
+        capture_env_count,
+        enabled=True,
+        geometry_randomization_enabled=False,
+    )
     sim.reset()
     scene.reset()
     material_bindings = apply_visual_servo_materials()
     print(
         f"[INFO] Applied goal-capture visual material profile "
         f"{material_bindings['profile']}.",
+        flush=True,
+    )
+    print(
+        f"[INFO] Applied canonical render-only workspace profile "
+        f"{tslot_bindings['profile']} over the flat collision plane.",
         flush=True,
     )
 
@@ -411,12 +504,20 @@ def main() -> None:
         VISUAL_SERVO_MATERIAL_PROFILE
     )
     payload["visual_scene_profile"] = np.asarray(VISUAL_SERVO_SCENE_PROFILE)
+    payload["visual_tslot_profile"] = np.asarray(VISUAL_SERVO_TSLOT_PROFILE)
     payload["goal_camera_profile"] = np.asarray(
         D405_VISUAL_SERVO_CAMERA_PROFILE
     )
     payload["goal_observation_profile"] = np.asarray(
         D405_VISUAL_SERVO_OBSERVATION_PROFILE
     )
+    if args_cli.contact_sheet is not None:
+        _write_contact_sheet(
+            path=args_cli.contact_sheet.resolve(),
+            rgb=rgb,
+            target_ids=payload["target_ids"].astype(str),
+        )
+        print(f"[DONE] Wrote diagnostic contact sheet to {args_cli.contact_sheet.resolve()}.", flush=True)
 
     target_ids = payload["target_ids"].astype(str)
     part_ids = payload.get("part_ids", np.asarray([""] * target_count)).astype(str)
@@ -552,5 +653,12 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        # Kit may otherwise close the application before Python prints the
+        # exception, making a failed diagnostic capture look successful.
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         simulation_app.close()

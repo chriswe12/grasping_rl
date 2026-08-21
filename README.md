@@ -71,33 +71,100 @@ Goal capture and the live task both derive field of view from the calibrated
 848 x 480 D405 intrinsics while rendering a 256 x 144 buffer. Treating that
 render buffer as the intrinsic reference would incorrectly narrow the goal
 view to about 30 degrees. Catalogs are labeled with camera,
-observation-preprocessing, material, and visual-scene profiles and are rejected
+observation-preprocessing, material, visual-scene, and workspace profiles and are rejected
 if they do not match the task. The shared canonical scene uses a low-level dome
 fill plus one angled distant key, explicit DLAA, four direct-light samples per
 pixel, DL denoising, and shadows. The distant key gives every cloned
-environment the same lighting without creating one light per environment. The shared material
-profile renders the part as matte brown PLA, the two fingers as readable matte
-black, and the work surface dark charcoal, so the exact goal visibly includes
-both fingers around the part. Both live and goal RGB-D are area-filtered once
+environment the same lighting without creating one light per environment. The canonical material
+profile renders the part as muted brown PLA, the two fingers as matte yellow,
+and the work surface as a small-pitch aluminum T-slot plate. The visual plate
+uses half the earlier prototype scale: approximately 5 mm slots, 20.5 mm lands,
+and 25.5 mm pitch. Its render/depth grooves sit over an unchanged flat z=0
+collision plane. Both live and goal RGB-D are area-filtered once
 from 256 x 144 to the 128 x 72 policy input instead of nearest-neighbor sampled.
 
 During training only, domain randomization is applied to the live RGB-D tensor;
-the selected catalog goal remains the deterministic canonical reference. Each
-environment samples episode-stable exposure, contrast, gamma, white balance,
-vignetting, blur, depth scale/bias, and occasional small RGB/depth patches.
-Occluded RGB patches use the live-frame mean and missing depth uses maximum
+the selected catalog goal remains the deterministic canonical reference. The
+default `combined_sim2real` profile samples episode-stable exposure, contrast,
+gamma, white balance, vignetting, blur, depth scale/bias, and occasional small
+RGB/depth patches. Depth error is generated mainly in disparity space with
+episode-stable low-frequency structure, temporally correlated structure,
+independent residual noise, horizontal stereo-edge failures, 0.1 mm
+quantization, invalid range handling, and sparse dropout. It therefore does not
+make the false assumption that every depth pixel is independent. Occluded RGB
+patches use the live-frame mean and missing depth uses maximum
 range rather than an artificial black rectangle. RGB noise, metric depth
 noise, millimetre quantization, and edge-weighted missing depth vary per frame.
 The physical live scene also changes key-light direction/intensity/temperature,
-shadow position, part hue/brightness/roughness, and ground hue/brightness/
-roughness. All appearance strength ramps with the curriculum. Playback,
-evaluation, and composite debug recording disable these augmentations. This
-matches deployment: a real D405 live observation is compared with a fixed
-synthetic goal catalog.
-The active extrinsic is the CAD-derived camera pose expressed directly in the
-flange/link7 frame: `t = (55.667, 9.000, 70.776) mm` and
-`R = [[0, -sqrt(3)/2, -1/2], [1, 0, 0], [0, -1/2, sqrt(3)/2]]`.
-No legacy 35 mm `lbr_link_ee` offset is added.
+shadow position, and T-slot color/roughness. Part appearance is sampled
+independently per environment from a weighted 24-color muted FDM palette.
+T-slot phase and orientation vary between cloned training environments, while
+nominal goal capture and evaluation use the canonical small-pitch layout.
+The collision surface is always the same flat z=0 plane.
+All appearance strength ramps with the curriculum and clean episodes remain canonical. Playback,
+composite debug recording, and nominal evaluation disable these augmentations;
+profile-specific evaluation can enable them deliberately. This matches
+deployment: a real D405 live observation is compared with a fixed synthetic
+goal catalog.
+
+The same profile also applies a coupled RGB-D calibration warp, zero-to-two
+policy-step live-frame delay, rare repeated frames, zero-to-two-step motion
+delay, bounded actuator response scale/bias/low-pass behavior, and +/-10%
+joint stiffness/damping variation. Fifteen percent of environments remain
+clean. These are provisional engineering ranges based on documented D405/D400
+geometry, not measurements of this specific unit. Object mass and contact
+friction are not randomized because this alignment task keeps the part
+kinematic and terminates before grasp contact; changing them would not affect
+the generated transition distribution.
+
+The available reproducible profiles are `nominal`, `sensor_only`,
+`camera_uncertainty`, `timing_control`, `appearance`, `combined_sim2real`,
+`combined_clutter`, `combined_depth_robust`, and `stress_test`. Training defaults to
+`combined_sim2real`; evaluation defaults to
+`nominal`. The exact profile ID and overrides are stored in `params/env.yaml`,
+`params/sim2real_profile.yaml`, and TensorBoard text. Select one explicitly:
+
+```bash
+/media/pdz/Elements1/IsaacLab-2.3.2/isaaclab.sh -p \
+  isaac_rl/scripts/rl_games/train.py \
+  --task Grasp-Visual-Servo-RGBD-MultiPart-Direct-v0 \
+  --num_envs 256 --max_iterations 10000 \
+  --sim2real_profile combined_sim2real --headless --enable_cameras
+```
+
+`combined_clutter` is a controlled extension of `combined_sim2real`: 60% of
+cloned environments contain one to three peripheral colored primitives and
+40% stay clutter-free. The props affect wrist RGB and depth but are render-only,
+carry no collision schema, and remain outside the nominal target/approach
+corridor. The T-slot and clutter profiles both retain `/World/GroundPlane` as
+the only workspace collision surface. This trains visual distractor tolerance;
+it is not permission to execute through physical clutter on the real robot.
+
+`combined_depth_robust` keeps the combined scene clutter-free and strengthens
+only the depth-error bracket. Relative scale expands from +/-1% to +/-1.5%,
+constant bias from +/-2.0 mm to +/-3.5 mm, and per-frame metric residual noise
+from at most 0.2 mm to 0.4 mm. Disparity bias expands from +/-0.04 px to +/-0.08
+px, spatial/temporal correlated errors to 0.12/0.07 px, stereo-edge mismatch
+from 12% to 22%, ordinary dropout from at most 0.4% to 0.8%, edge dropout from
+3.5% to 7%, and depth-patch probability from 4% to 8%. It retains 15% clean
+episodes and the same RGB, calibration, timing, controller, lighting, material,
+and T-slot distributions. These are deliberately stronger provisional bounds,
+not measured specifications for the project cameras.
+The active orientation is the hand-eye calibration for RealSense serial
+`260322275185`, expressed in MoveIt's `lbr_link_ee` frame: `R = [[0.002322, -0.865422, 0.501038],
+[0.999495, -0.013867, -0.028583], [0.031685, 0.500851, 0.864953]]`.
+MoveIt defines `lbr_link_ee` as `+35 mm` along local link7-Z with identity
+rotation. A visually confirmed 180-degree correction about the tool-Z axis
+reconciles that calibration-parent convention with the generated Isaac USD,
+and the visually adjusted camera origin is `t_lbr_link_ee = (55.667, 9.000,
+70.776) mm`. Isaac therefore uses `t_link7 = (55.667, 9.000, 105.776) mm`
+and applies the tool-Z correction to the camera axes. Its RGB
+`camera_color_optical_frame` calibration is 848x480, with
+`fx=436.3104`, `fy=435.6493`, `cx=418.6266`, and `cy=236.5121` pixels. The
+source also supplies plumb-bob distortion coefficients; they are retained in
+camera metadata, while the current Isaac pinhole renderer uses its native
+undistorted projection. This is profile v7, so the synthetic goal catalogue
+must be re-rendered before retraining.
 
 The companion `data/multigrasp_50_rotation_resets.npz` contains 16 validated,
 position-preserving rotational reset paths per grasp. Every path covers the
@@ -137,7 +204,7 @@ The actor observation is now 73,742 values and the shared-head architecture
 changed. Start a fresh run; checkpoints produced before this revision,
 including earlier seven-action completion policies, are not load-compatible.
 
-Any catalog captured with an older visual, material, or observation profile is
+Any catalog captured with an older visual, material, workspace, or observation profile is
 intentionally rejected. Regenerate it end to end before starting a fresh
 training run. The normal Python orchestrator starts mock MoveIt,
 validates/replaces targets, builds reset paths, renders the goals in batches,
@@ -220,8 +287,19 @@ noise is 0.040, 0.016, and 0.005 rad. For example:
   --task Grasp-Visual-Servo-RGBD-Direct-Play-v0 \
   --checkpoint <checkpoint.pth> --catalog_split all \
   --runs_per_target 3 --episode_seconds 15 \
-  --conditions far mid close --rotation_deg 15 --headless
+  --conditions far mid close --rotation_deg 15 \
+  --sim2real_profile combined_sim2real --headless
 ```
+
+Run the evaluator once per profile to separate nominal policy quality from
+sensor, calibration, timing/control, appearance, and combined robustness. Each
+`summary.json`, Markdown report, and episode CSV records the selected profile.
+The report also separates completion from motion quality: it includes
+threshold precision/recall, false-positive rate, Brier score, expected
+calibration error, and ready/negative probability means. These metrics use
+privileged ready labels only during evaluation and exclude the intentionally
+unsupervised tolerance band; the deployed policy still receives no geometric
+completion label.
 
 `record_debug_videos.py` records a composite 1600x900 MP4 for each requested
 condition. Each frame contains an external side view, the exact downsampled

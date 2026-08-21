@@ -13,13 +13,13 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from grasp_planning.d405_wrist_camera import (
     D405_VISUAL_SERVO_CAMERA_PROFILE,
     D405_VISUAL_SERVO_OBSERVATION_PROFILE,
     VISUAL_SERVO_OBSERVATION_HEIGHT,
     VISUAL_SERVO_OBSERVATION_WIDTH,
     D405WristCameraConfig,
+    camera_rotation_in_link7,
 )
 from grasp_planning.envs.fr3_part_env import _spawn_local_ground_plane
 from grasp_planning.isaac_visual_materials import (
@@ -32,6 +32,11 @@ from grasp_planning.isaac_visual_scene import (
     spawn_visual_servo_lights,
 )
 from grasp_planning.planning.fr3_motion_context import FR3MotionContext, grasp_pose_to_tcp_pose
+from grasp_planning.rl.d405_observation import (
+    D405ObservationPreprocessCfg,
+    pack_policy_rgbd_torch,
+    resize_aligned_rgbd_torch,
+)
 from grasp_planning.rl.live_observation_randomization import (
     LiveObservationRandomizationCfg,
     LiveObservationRandomizer,
@@ -43,6 +48,12 @@ from grasp_planning.rl.scene_appearance_randomization import (
 from grasp_planning.start_poses import (
     KUKA_Y_GRIPPER_APPROACH_PROFILE,
     KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M,
+)
+from grasp_planning.visual_servo_clutter import spawn_visual_servo_clutter
+from grasp_planning.visual_servo_workspace import (
+    VISUAL_SERVO_TSLOT_PROFILE,
+    LiveWorkspaceAppearanceRandomizer,
+    spawn_visual_servo_tslot_surfaces,
 )
 
 import isaaclab.sim as sim_utils
@@ -94,7 +105,10 @@ class GraspVisualServoEnv(DirectRLEnv):
     def __init__(self, cfg: GraspVisualServoEnvCfg, render_mode: str | None = None, **kwargs):
         self.live_observation_randomizer: LiveObservationRandomizer | None = None
         self.scene_appearance_randomizer: SceneAppearanceRandomizer | None = None
+        self.live_workspace_appearance_randomizer: LiveWorkspaceAppearanceRandomizer | None = None
         self.visual_light_paths: dict[str, str] = {}
+        self.tslot_visual_bindings: dict[str, object] = {}
+        self.clutter_visual_bindings: dict[str, object] = {}
         super().__init__(cfg, render_mode, **kwargs)
         self.visual_material_bindings = apply_visual_servo_materials()
         if self.cfg.scene_appearance_randomization_enabled:
@@ -125,6 +139,20 @@ class GraspVisualServoEnv(DirectRLEnv):
                 force=True,
                 strength=0.0 if self.cfg.training_curriculum_enabled else 1.0,
             )
+            self.live_workspace_appearance_randomizer = LiveWorkspaceAppearanceRandomizer(
+                part_shader_paths_by_env=self.visual_material_bindings["part_shaders_by_env"],
+                tslot_aluminum_shader_paths=self.tslot_visual_bindings["aluminum_shader_paths"],
+                num_envs=self.num_envs,
+                device=self.device,
+                part_color_scale=tuple(self.cfg.scene_part_color_scale),
+                part_saturation_scale=tuple(self.cfg.scene_part_saturation_scale),
+                part_hue_shift_deg=tuple(self.cfg.scene_part_hue_shift_deg),
+                part_roughness=tuple(self.cfg.scene_part_roughness),
+                tslot_color_scale=tuple(self.cfg.scene_tslot_color_scale),
+                tslot_saturation_scale=tuple(self.cfg.scene_tslot_saturation_scale),
+                tslot_hue_shift_deg=tuple(self.cfg.scene_tslot_hue_shift_deg),
+                tslot_roughness_delta=tuple(self.cfg.scene_tslot_roughness_delta),
+            )
         self.context = FR3MotionContext(
             robot=self.robot,
             scene=self.scene,
@@ -133,6 +161,29 @@ class GraspVisualServoEnv(DirectRLEnv):
         )
         self.arm_ids = self.context.arm_joint_ids
         self.previous_actions = torch.zeros((self.num_envs, 6), device=self.device)
+        self.filtered_motion_actions = torch.zeros_like(self.previous_actions)
+        self.motion_action_delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.motion_response_scale = torch.ones((self.num_envs, 1), device=self.device)
+        self.motion_response_alpha = torch.ones((self.num_envs, 1), device=self.device)
+        self.motion_bias = torch.zeros_like(self.previous_actions)
+        self.physics_joint_stiffness_scale = torch.ones((self.num_envs, 1), device=self.device)
+        self.physics_joint_damping_scale = torch.ones((self.num_envs, 1), device=self.device)
+        action_history_length = max(1, int(self.cfg.motion_action_delay_max_steps) + 1)
+        self.motion_action_history = torch.zeros((action_history_length, self.num_envs, 6), device=self.device)
+        self.live_observation_delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        observation_history_length = max(1, int(self.cfg.live_observation_delay_max_steps) + 1)
+        self.live_observation_history = torch.zeros(
+            (
+                observation_history_length,
+                self.num_envs,
+                VISUAL_SERVO_OBSERVATION_HEIGHT,
+                VISUAL_SERVO_OBSERVATION_WIDTH,
+                4,
+            ),
+            dtype=torch.float16,
+            device=self.device,
+        )
+        self.live_observation_history_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.completion_probability = torch.zeros(self.num_envs, device=self.device)
         self.completion_stop_candidate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.completion_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -159,8 +210,10 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.curriculum_progress_min = float(self.cfg.reset_progress_min)
         self.curriculum_perturbation_scale = 1.0
         self.curriculum_visual_strength = 1.0
+        self.camera_config = D405WristCameraConfig()
+        self.observation_preprocess_cfg = D405ObservationPreprocessCfg.from_camera(self.camera_config)
         self.rotation_tcp_from_camera = torch.tensor(
-            D405WristCameraConfig().rotation_camera_in_calibration_parent,
+            camera_rotation_in_link7(self.camera_config),
             dtype=torch.float32,
             device=self.device,
         ).reshape(1, 3, 3)
@@ -178,6 +231,16 @@ class GraspVisualServoEnv(DirectRLEnv):
                 depth_scale=tuple(self.cfg.live_depth_scale),
                 depth_bias_m=tuple(self.cfg.live_depth_bias_m),
                 depth_noise_std_m=tuple(self.cfg.live_depth_noise_std_m),
+                correlated_depth_enabled=bool(self.cfg.live_correlated_depth_enabled),
+                stereo_focal_length_px=float(self.cfg.live_stereo_focal_length_px),
+                stereo_baseline_m=float(self.cfg.live_stereo_baseline_m),
+                disparity_bias_px=tuple(self.cfg.live_disparity_bias_px),
+                disparity_independent_noise_std_px=tuple(self.cfg.live_disparity_independent_noise_std_px),
+                disparity_spatial_noise_std_px=tuple(self.cfg.live_disparity_spatial_noise_std_px),
+                disparity_temporal_noise_std_px=tuple(self.cfg.live_disparity_temporal_noise_std_px),
+                disparity_temporal_correlation=tuple(self.cfg.live_disparity_temporal_correlation),
+                stereo_edge_mismatch_probability=float(self.cfg.live_stereo_edge_mismatch_probability),
+                stereo_edge_horizontal_radius_px=int(self.cfg.live_stereo_edge_horizontal_radius_px),
                 depth_quantization_m=float(self.cfg.live_depth_quantization_m),
                 depth_dropout_probability=tuple(self.cfg.live_depth_dropout_probability),
                 depth_edge_dropout_probability=tuple(self.cfg.live_depth_edge_dropout_probability),
@@ -185,6 +248,14 @@ class GraspVisualServoEnv(DirectRLEnv):
                 rgb_patch_occlusion_probability=float(self.cfg.live_rgb_patch_occlusion_probability),
                 depth_patch_dropout_probability=float(self.cfg.live_depth_patch_dropout_probability),
                 patch_area_fraction=tuple(self.cfg.live_patch_area_fraction),
+                calibration_warp_enabled=bool(self.cfg.live_calibration_warp_enabled),
+                calibration_shift_x_px=tuple(self.cfg.live_calibration_shift_x_px),
+                calibration_shift_y_px=tuple(self.cfg.live_calibration_shift_y_px),
+                calibration_scale=tuple(self.cfg.live_calibration_scale),
+                calibration_roll_deg=tuple(self.cfg.live_calibration_roll_deg),
+                clean_episode_fraction=float(self.cfg.live_clean_episode_fraction),
+                depth_min_m=float(self.camera_config.reliable_depth_range_m[0]),
+                depth_max_m=float(self.camera_config.reliable_depth_range_m[1]),
             ),
             num_envs=self.num_envs,
             device=self.device,
@@ -222,6 +293,14 @@ class GraspVisualServoEnv(DirectRLEnv):
                     f"catalog='{scene_profile or 'unlabeled'}', "
                     f"environment='{VISUAL_SERVO_SCENE_PROFILE}'. Re-capture the "
                     "catalog under the canonical lighting and RTX profile."
+                )
+            tslot_profile = str(np.asarray(complete_catalog.get("visual_tslot_profile", "")).item())
+            if tslot_profile != VISUAL_SERVO_TSLOT_PROFILE:
+                raise ValueError(
+                    "Goal catalog workspace mismatch: "
+                    f"catalog='{tslot_profile or 'unlabeled'}', "
+                    f"environment='{VISUAL_SERVO_TSLOT_PROFILE}'. Re-capture the "
+                    "catalog over the canonical small-pitch T-slot surface."
                 )
             camera_profile = str(np.asarray(complete_catalog.get("goal_camera_profile", "")).item())
             if camera_profile != D405_VISUAL_SERVO_CAMERA_PROFILE:
@@ -353,24 +432,18 @@ class GraspVisualServoEnv(DirectRLEnv):
                 f"Catalog goal images have shape {raw_rgb.shape[1:3]}, but this task's "
                 f"camera requires {expected_raw_shape}."
             )
-        observation_size = (
-            VISUAL_SERVO_OBSERVATION_HEIGHT,
-            VISUAL_SERVO_OBSERVATION_WIDTH,
-        )
         goal_rgb_t = torch.as_tensor(raw_rgb, device=self.device).float().div_(255.0)
-        goal_rgb_t = F.interpolate(
-            goal_rgb_t.permute(0, 3, 1, 2),
-            size=observation_size,
-            mode="area",
-        ).permute(0, 2, 3, 1)
-        goal_depth_t = torch.as_tensor(raw_depth, device=self.device).float().unsqueeze(1)
-        goal_depth_t = F.interpolate(
+        goal_depth_t = torch.as_tensor(raw_depth, device=self.device).float().unsqueeze(-1)
+        goal_rgb_t, goal_depth_t, _goal_valid = resize_aligned_rgbd_torch(
+            goal_rgb_t,
             goal_depth_t,
-            size=observation_size,
-            mode="area",
-        ).permute(0, 2, 3, 1)
-        goal_depth_t = goal_depth_t.sub_(0.04).div_(0.46).clamp_(0.0, 1.0)
-        self.goal_rgbd_catalog = torch.cat((goal_rgb_t, goal_depth_t), dim=-1)
+            cfg=self.observation_preprocess_cfg,
+        )
+        self.goal_rgbd_catalog = pack_policy_rgbd_torch(
+            goal_rgb_t,
+            goal_depth_t,
+            cfg=self.observation_preprocess_cfg,
+        )
         self.goal_rgbd = self.goal_rgbd_catalog[0:1].repeat(self.num_envs, 1, 1, 1)
         self.goal_tcp_position = self.goal_tcp_positions_catalog[0:1].repeat(self.num_envs, 1)
         self.goal_tcp_position += self.scene.env_origins
@@ -520,6 +593,22 @@ class GraspVisualServoEnv(DirectRLEnv):
         )
         ground_cfg.func("/World/GroundPlane", ground_cfg)
         self.scene.clone_environments(copy_from_source=False)
+        self.tslot_visual_bindings = spawn_visual_servo_tslot_surfaces(
+            self.num_envs,
+            enabled=bool(self.cfg.scene_tslot_surface_enabled),
+            geometry_randomization_enabled=bool(self.cfg.scene_tslot_geometry_randomization_enabled),
+            seed=int(self.cfg.seed),
+            nominal_fraction=float(self.cfg.scene_tslot_nominal_fraction),
+            phase_fraction=float(self.cfg.scene_tslot_phase_fraction),
+        )
+        self.clutter_visual_bindings = spawn_visual_servo_clutter(
+            self.num_envs,
+            enabled=bool(self.cfg.scene_clutter_enabled),
+            seed=int(self.cfg.seed) + 10_003,
+            environment_fraction=float(self.cfg.scene_clutter_environment_fraction),
+            min_objects=int(self.cfg.scene_clutter_min_objects),
+            max_objects=int(self.cfg.scene_clutter_max_objects),
+        )
         self.scene.articulations["robot"] = self.robot
         for part_index, part in enumerate(self.parts):
             key = "part" if len(self.parts) == 1 else f"part_{part_index}"
@@ -595,7 +684,16 @@ class GraspVisualServoEnv(DirectRLEnv):
         if actions.shape[-1] != 7:
             raise ValueError(f"Expected six motion actions plus completion, got shape {tuple(actions.shape)}.")
         requested_actions = actions[:, :6].clamp(-1.0, 1.0)
-        action_delta = (requested_actions - self.previous_actions).clamp(
+        if self.motion_action_history.shape[0] > 1:
+            self.motion_action_history[1:] = self.motion_action_history[:-1].clone()
+        self.motion_action_history[0].copy_(requested_actions)
+        env_indices = torch.arange(self.num_envs, device=self.device)
+        delayed_actions = self.motion_action_history[self.motion_action_delay_steps, env_indices]
+        response_target = delayed_actions * self.motion_response_scale + self.motion_bias
+        self.filtered_motion_actions.mul_(1.0 - self.motion_response_alpha).add_(
+            response_target * self.motion_response_alpha
+        )
+        action_delta = (self.filtered_motion_actions - self.previous_actions).clamp(
             -float(self.cfg.action_delta_limit),
             float(self.cfg.action_delta_limit),
         )
@@ -624,6 +722,79 @@ class GraspVisualServoEnv(DirectRLEnv):
             )
         )
         self.completion_declaration.copy_(self.completion_streak >= int(self.cfg.completion_required_consecutive_steps))
+
+    def _sample_sim2real_dynamics(self, env_ids: torch.Tensor) -> None:
+        """Sample training-only timing and controller response per reset."""
+
+        count = len(env_ids)
+        if count == 0:
+            return
+        visual_strength = self.live_observation_randomizer.randomization_strength[env_ids].flatten()
+        randomized = visual_strength > 0.0
+        observation_max = int(self.cfg.live_observation_delay_max_steps)
+        if observation_max > 0:
+            sampled_observation_delay = torch.randint(observation_max + 1, (count,), device=self.device)
+            self.live_observation_delay_steps[env_ids] = torch.where(
+                randomized, sampled_observation_delay, torch.zeros_like(sampled_observation_delay)
+            )
+        else:
+            self.live_observation_delay_steps[env_ids] = 0
+
+        action_max = int(self.cfg.motion_action_delay_max_steps)
+        if action_max > 0:
+            ordinary_max = min(action_max, 1)
+            ordinary_delay = torch.randint(ordinary_max + 1, (count,), device=self.device)
+            if action_max >= 2:
+                use_two_steps = torch.rand(count, device=self.device) < float(
+                    self.cfg.motion_action_two_step_probability
+                )
+                sampled_action_delay = torch.where(
+                    use_two_steps,
+                    torch.full_like(ordinary_delay, 2),
+                    ordinary_delay,
+                )
+            else:
+                sampled_action_delay = ordinary_delay
+            self.motion_action_delay_steps[env_ids] = torch.where(
+                randomized, sampled_action_delay, torch.zeros_like(sampled_action_delay)
+            )
+        else:
+            self.motion_action_delay_steps[env_ids] = 0
+
+        def uniform(value_range: tuple[float, float], shape: tuple[int, ...]) -> torch.Tensor:
+            lower, upper = value_range
+            if lower == upper:
+                return torch.full(shape, float(lower), device=self.device)
+            return torch.empty(shape, device=self.device).uniform_(float(lower), float(upper))
+
+        response_scale = uniform(tuple(self.cfg.motion_response_scale), (count, 1))
+        response_alpha = uniform(tuple(self.cfg.motion_response_alpha), (count, 1))
+        motion_bias = uniform(tuple(self.cfg.motion_bias), (count, 6))
+        stiffness_scale = uniform(tuple(self.cfg.physics_joint_stiffness_scale), (count, 1))
+        damping_scale = uniform(tuple(self.cfg.physics_joint_damping_scale), (count, 1))
+        randomized_column = randomized.unsqueeze(-1)
+        self.motion_response_scale[env_ids] = torch.where(
+            randomized_column, response_scale, torch.ones_like(response_scale)
+        )
+        self.motion_response_alpha[env_ids] = torch.where(
+            randomized_column, response_alpha, torch.ones_like(response_alpha)
+        )
+        self.motion_bias[env_ids] = torch.where(randomized_column, motion_bias, torch.zeros_like(motion_bias))
+        self.physics_joint_stiffness_scale[env_ids] = torch.where(
+            randomized_column, stiffness_scale, torch.ones_like(stiffness_scale)
+        )
+        self.physics_joint_damping_scale[env_ids] = torch.where(
+            randomized_column, damping_scale, torch.ones_like(damping_scale)
+        )
+        stiffness = (
+            self.robot.data.default_joint_stiffness[env_ids][:, self.arm_ids]
+            * self.physics_joint_stiffness_scale[env_ids]
+        )
+        damping = (
+            self.robot.data.default_joint_damping[env_ids][:, self.arm_ids] * self.physics_joint_damping_scale[env_ids]
+        )
+        self.robot.write_joint_stiffness_to_sim(stiffness, joint_ids=self.arm_ids, env_ids=env_ids)
+        self.robot.write_joint_damping_to_sim(damping, joint_ids=self.arm_ids, env_ids=env_ids)
 
     def _apply_action(self) -> None:
         _, tcp_quaternion, _, _ = self._tcp_error()
@@ -673,18 +844,39 @@ class GraspVisualServoEnv(DirectRLEnv):
     def _camera_observation(self, *, randomize_live: bool = True) -> torch.Tensor:
         output = self.wrist_camera.data.output
         rgb = output["rgb"][..., :3].float().div(255.0)
-        depth = torch.nan_to_num(output["distance_to_image_plane"].float(), nan=0.50, posinf=0.50, neginf=0.04)
+        depth = torch.nan_to_num(output["distance_to_image_plane"].float(), nan=0.0, posinf=0.0, neginf=0.0)
         if depth.ndim == 3:
             depth = depth.unsqueeze(-1)
-        observation_size = (
-            VISUAL_SERVO_OBSERVATION_HEIGHT,
-            VISUAL_SERVO_OBSERVATION_WIDTH,
+        rgb, depth, _valid = resize_aligned_rgbd_torch(
+            rgb,
+            depth,
+            cfg=self.observation_preprocess_cfg,
         )
-        rgb = F.interpolate(rgb.permute(0, 3, 1, 2), size=observation_size, mode="area").permute(0, 2, 3, 1)
-        depth = F.interpolate(depth.permute(0, 3, 1, 2), size=observation_size, mode="area").permute(0, 2, 3, 1)
         if randomize_live and self.live_observation_randomizer is not None:
             rgb, depth = self.live_observation_randomizer.apply(rgb, depth)
-        rgbd = torch.cat((rgb, depth.sub(0.04).div(0.46).clamp(0.0, 1.0)), dim=-1)
+        rgbd = pack_policy_rgbd_torch(rgb, depth, cfg=self.observation_preprocess_cfg)
+        timing_enabled = randomize_live and (
+            self.live_observation_history.shape[0] > 1 or float(self.cfg.live_observation_repeat_probability) > 0.0
+        )
+        if timing_enabled:
+            previously_valid = self.live_observation_history_valid.clone()
+            repeated = previously_valid & (
+                torch.rand(self.num_envs, device=self.device) < float(self.cfg.live_observation_repeat_probability)
+            )
+            newest = torch.where(
+                repeated.view(-1, 1, 1, 1),
+                self.live_observation_history[0].float(),
+                rgbd,
+            )
+            if self.live_observation_history.shape[0] > 1:
+                self.live_observation_history[1:] = self.live_observation_history[:-1].clone()
+            self.live_observation_history[0].copy_(newest.to(torch.float16))
+            first_frame_envs = torch.nonzero(~previously_valid, as_tuple=False).flatten()
+            if first_frame_envs.numel() > 0:
+                self.live_observation_history[:, first_frame_envs] = newest[first_frame_envs].to(torch.float16)
+            self.live_observation_history_valid[:] = True
+            env_indices = torch.arange(self.num_envs, device=self.device)
+            rgbd = self.live_observation_history[self.live_observation_delay_steps, env_indices].float()
         return torch.cat((rgbd, self.goal_rgbd), dim=-1)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -860,7 +1052,28 @@ class GraspVisualServoEnv(DirectRLEnv):
             "target_coverage_fraction": position_norm.new_tensor(
                 torch.unique(self.target_index).numel() / float(self.target_count)
             ),
+            "sim2real/observation_delay_steps": self.live_observation_delay_steps.float().mean(),
+            "sim2real/motion_action_delay_steps": self.motion_action_delay_steps.float().mean(),
+            "sim2real/motion_response_scale": self.motion_response_scale.mean(),
+            "sim2real/motion_response_alpha": self.motion_response_alpha.mean(),
+            "sim2real/motion_bias_abs_mean": self.motion_bias.abs().mean(),
+            "sim2real/joint_stiffness_scale": self.physics_joint_stiffness_scale.mean(),
+            "sim2real/joint_damping_scale": self.physics_joint_damping_scale.mean(),
         }
+        if self.live_observation_randomizer is not None:
+            log.update(
+                {
+                    "sim2real/clean_episode_rate": (
+                        self.live_observation_randomizer.randomization_strength.flatten() <= 0.0
+                    )
+                    .float()
+                    .mean(),
+                    "sim2real/disparity_error_abs_mean_px": (
+                        self.live_observation_randomizer.last_disparity_error_abs_mean_px
+                    ),
+                    "sim2real/depth_invalid_fraction": (self.live_observation_randomizer.last_depth_invalid_fraction),
+                }
+            )
         if self.scene_appearance_randomizer is not None and self.scene_appearance_randomizer.current_sample is not None:
             appearance = self.scene_appearance_randomizer.current_sample
             log.update(
@@ -870,6 +1083,21 @@ class GraspVisualServoEnv(DirectRLEnv):
                     "appearance/key_intensity": position_norm.new_tensor(appearance.key_intensity),
                     "appearance/key_angle_deg": position_norm.new_tensor(appearance.key_angle_deg),
                     "appearance/dome_intensity": position_norm.new_tensor(appearance.dome_intensity),
+                }
+            )
+        if self.live_workspace_appearance_randomizer is not None:
+            log.update(
+                {
+                    "appearance/canonical_part_fraction": (
+                        self.live_workspace_appearance_randomizer.part_palette_index == 0
+                    ).float().mean(),
+                    "appearance/nominal_tslot_fraction": (
+                        self.live_workspace_appearance_randomizer.background_index == 0
+                    ).float().mean(),
+                    "appearance/clutter_environment_fraction": position_norm.new_tensor(
+                        float(self.clutter_visual_bindings.get("active_environment_count", 0))
+                        / float(self.num_envs)
+                    ),
                 }
             )
         # Preserve per-environment terminal measurements for batched policy
@@ -897,6 +1125,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             "rotation_error_rad": rotation_norm.clone(),
             "success": correct_completion.clone(),
             "geometric_ready": labels.ready.clone(),
+            "completion_supervised": labels.supervised.clone(),
             "completion_probability": self.completion_probability.clone(),
             "completion_declared": self.completion_declaration.clone(),
             "premature_completion": premature_completion.clone(),
@@ -1250,6 +1479,9 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.robot.write_joint_state_to_sim(q, qd, joint_ids=self.arm_ids, env_ids=env_ids)
         self.robot.set_joint_position_target(q, joint_ids=self.arm_ids, env_ids=env_ids)
         self.previous_actions[env_ids] = 0.0
+        self.filtered_motion_actions[env_ids] = 0.0
+        self.motion_action_history[:, env_ids] = 0.0
+        self.live_observation_history_valid[env_ids] = False
         self.completion_probability[env_ids] = 0.0
         self.completion_stop_candidate[env_ids] = False
         self.completion_streak[env_ids] = 0
@@ -1291,3 +1523,9 @@ class GraspVisualServoEnv(DirectRLEnv):
                 env_ids,
                 strength=curriculum.visual_randomization_strength,
             )
+            if self.live_workspace_appearance_randomizer is not None:
+                self.live_workspace_appearance_randomizer.sample(
+                    env_ids,
+                    strength=self.live_observation_randomizer.randomization_strength[env_ids],
+                )
+            self._sample_sim2real_dynamics(env_ids)

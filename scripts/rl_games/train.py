@@ -11,6 +11,13 @@ import argparse
 import math
 import sys
 from distutils.util import strtobool
+from pathlib import Path
+
+# Keep the external project importable when this file is launched directly by
+# Isaac Sim. Python otherwise puts only isaac_rl/scripts/rl_games on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from isaaclab.app import AppLauncher
 
@@ -31,6 +38,31 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--global_minibatch_size",
+    type=int,
+    default=None,
+    help=(
+        "Target effective PPO minibatch across all distributed ranks. "
+        "Defaults to the agent configuration's single-GPU minibatch."
+    ),
+)
+parser.add_argument(
+    "--sim2real_profile",
+    choices=(
+        "nominal",
+        "sensor_only",
+        "camera_uncertainty",
+        "timing_control",
+        "appearance",
+        "combined_sim2real",
+        "combined_clutter",
+        "combined_depth_robust",
+        "stress_test",
+    ),
+    default="combined_sim2real",
+    help="Named randomization profile recorded with this training run.",
+)
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
 parser.add_argument("--wandb-name", type=str, default=None, help="the name of wandb's run")
@@ -63,6 +95,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import json
 import logging
 import os
 import random
@@ -71,7 +104,6 @@ from datetime import datetime
 
 import gymnasium as gym
 from rl_games.common import a2c_common, env_configurations, vecenv
-from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
 from tensorboardX import SummaryWriter
 
@@ -95,6 +127,13 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 logger = logging.getLogger(__name__)
 
 import isaac_rl.tasks  # noqa: F401
+from grasp_planning.d405_wrist_camera import (
+    D405_VISUAL_SERVO_CAMERA_PROFILE,
+    D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+)
+from grasp_planning.rl.distributed_observer import DistributedSafeIsaacAlgoObserver
+from grasp_planning.rl.ppo_batching import resolve_local_minibatch_size
+from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (
     register_grasp_completion_runner,
 )
@@ -117,6 +156,16 @@ class EssentialSummaryWriter(SummaryWriter):
         "rewards/iter",
         "episode_lengths/iter",
     }
+    _run_metadata: dict[str, object] = {}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._run_metadata:
+            self.add_text(
+                "configuration/sim2real_profile",
+                "```json\n" + json.dumps(self._run_metadata, indent=2) + "\n```",
+                0,
+            )
 
     def add_scalar(self, tag, scalar_value, global_step=None, walltime=None, **kwargs):
         if tag == "losses/completion_probability_mean":
@@ -140,8 +189,36 @@ a2c_common.SummaryWriter = EssentialSummaryWriter
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with RL-Games agent."""
+    global_rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("ISAAC_RL_ORIGINAL_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
+    run_profile_metadata = {
+        "profile": sim2real_profile.name,
+        "profile_id": sim2real_profile.identifier,
+        "description": sim2real_profile.description,
+        "camera_profile": D405_VISUAL_SERVO_CAMERA_PROFILE,
+        "observation_profile": D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+        "overrides": dict(sim2real_profile.overrides),
+        "distributed": {
+            "enabled": bool(args_cli.distributed),
+            "world_size": world_size,
+            "environments_per_rank": None,
+            "total_environments": None,
+            "rollout_batch_size_per_rank": None,
+            "global_rollout_batch_size": None,
+            "target_global_minibatch_size": None,
+            "minibatch_size_per_rank": None,
+            "effective_global_minibatch_size": None,
+            "optimizer_updates_per_epoch": None,
+        },
+    }
+    EssentialSummaryWriter._run_metadata = run_profile_metadata
+    print(f"[INFO] Sim-to-real profile: {sim2real_profile.identifier} ({sim2real_profile.description})")
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    run_profile_metadata["distributed"]["environments_per_rank"] = env_cfg.scene.num_envs
+    run_profile_metadata["distributed"]["total_environments"] = env_cfg.scene.num_envs * world_size
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -188,7 +265,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
-    log_dir = agent_cfg["params"]["config"].get("full_experiment_name", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    log_dir = agent_cfg["params"]["config"].get("full_experiment_name")
+    if not log_dir:
+        log_dir = os.getenv("ISAAC_RL_EXPERIMENT_NAME") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # set directory into agent config
     # logging directory path: <train_dir>/<full_experiment_name>
     agent_cfg["params"]["config"]["train_dir"] = log_root_path
@@ -197,9 +276,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     experiment_name = log_dir if args_cli.wandb_name is None else args_cli.wandb_name
 
     # dump the configuration into log-directory
-    dump_yaml(os.path.join(log_root_path, log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_root_path, log_dir, "params", "agent.yaml"), agent_cfg)
+    if global_rank == 0:
+        dump_yaml(os.path.join(log_root_path, log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_root_path, log_dir, "params", "agent.yaml"), agent_cfg)
+        dump_yaml(
+            os.path.join(log_root_path, log_dir, "params", "sim2real_profile.yaml"),
+            run_profile_metadata,
+        )
     print(f"Exact experiment name requested from command line: {os.path.join(log_root_path, log_dir)}")
+    print(
+        f"[INFO] Distributed rank={global_rank}/{world_size} local_rank={local_rank} "
+        f"environments_per_rank={env_cfg.scene.num_envs} "
+        f"total_environments={env_cfg.scene.num_envs * world_size}"
+    )
 
     # read configurations about the agent-training
     rl_device = agent_cfg["params"]["config"]["device"]
@@ -252,27 +341,64 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set number of actors into agent config
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
-    # RL-Games requires the rollout batch to be exactly divisible by the
-    # minibatch size. Keep the large configured minibatch for normal parallel
-    # runs, but reduce it to the greatest valid divisor for smoke/small runs.
+    # RL-Games applies minibatch_size independently on every rank and then
+    # averages gradients. Treat the configured single-GPU value as the target
+    # *global* minibatch so adding GPUs does not silently multiply the
+    # effective gradient batch and reduce the updates made per rollout.
     train_cfg = agent_cfg["params"]["config"]
     rollout_batch_size = env.unwrapped.num_envs * train_cfg["horizon_length"]
-    configured_minibatch_size = train_cfg["minibatch_size"]
-    minibatch_size = math.gcd(rollout_batch_size, configured_minibatch_size)
+    global_rollout_batch_size = rollout_batch_size * world_size
+    target_global_minibatch_size = (
+        args_cli.global_minibatch_size
+        if args_cli.global_minibatch_size is not None
+        else train_cfg["minibatch_size"]
+    )
+    minibatch_size = resolve_local_minibatch_size(
+        rollout_batch_size_per_rank=rollout_batch_size,
+        target_global_minibatch_size=target_global_minibatch_size,
+        world_size=world_size,
+    )
+    effective_global_minibatch_size = minibatch_size * world_size
+    optimizer_updates_per_epoch = (
+        rollout_batch_size // minibatch_size * int(train_cfg["mini_epochs"])
+    )
     train_cfg["minibatch_size"] = minibatch_size
     if "central_value_config" in train_cfg:
         train_cfg["central_value_config"]["minibatch_size"] = minibatch_size
+    run_profile_metadata["distributed"].update(
+        {
+            "rollout_batch_size_per_rank": rollout_batch_size,
+            "global_rollout_batch_size": global_rollout_batch_size,
+            "target_global_minibatch_size": target_global_minibatch_size,
+            "minibatch_size_per_rank": minibatch_size,
+            "effective_global_minibatch_size": effective_global_minibatch_size,
+            "optimizer_updates_per_epoch": optimizer_updates_per_epoch,
+        }
+    )
+    if global_rank == 0:
+        # Rewrite the initially captured configuration with the resolved
+        # runtime batch sizes so pulled artifacts describe what actually ran.
+        dump_yaml(os.path.join(log_root_path, log_dir, "params", "agent.yaml"), agent_cfg)
+        dump_yaml(
+            os.path.join(log_root_path, log_dir, "params", "sim2real_profile.yaml"),
+            run_profile_metadata,
+        )
     print(
         f"[INFO] RL-Games rollout batch={rollout_batch_size}, "
-        f"minibatch={minibatch_size} ({env.unwrapped.num_envs} environments)."
+        f"global rollout batch={global_rollout_batch_size}, "
+        f"target global minibatch={target_global_minibatch_size}, "
+        f"minibatch/rank={minibatch_size}, "
+        f"effective global minibatch={effective_global_minibatch_size}, "
+        f"optimizer updates/epoch={optimizer_updates_per_epoch} "
+        f"({env.unwrapped.num_envs} environments/rank)."
     )
     # create runner from rl-games
 
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
-        observers = MultiObserver([IsaacAlgoObserver(), PbtAlgoObserver(agent_cfg, args_cli)])
+        observers = MultiObserver([DistributedSafeIsaacAlgoObserver(), PbtAlgoObserver(agent_cfg, args_cli)])
         runner = Runner(observers)
     else:
-        runner = Runner(IsaacAlgoObserver())
+        runner = Runner(DistributedSafeIsaacAlgoObserver())
 
     register_grasp_completion_runner(runner)
     runner.load(agent_cfg)
@@ -281,7 +407,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.reset()
     # train the agent
 
-    global_rank = int(os.getenv("RANK", "0"))
     if args_cli.track and global_rank == 0:
         if args_cli.wandb_entity is None:
             raise ValueError("Weights and Biases entity must be specified for tracking.")

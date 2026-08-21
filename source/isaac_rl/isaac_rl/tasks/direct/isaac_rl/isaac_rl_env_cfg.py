@@ -230,28 +230,76 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     live_rgb_blur_mix = (0.25, 0.60)
     live_depth_scale = (0.99, 1.01)
     live_depth_bias_m = (-0.002, 0.002)
-    live_depth_noise_std_m = (0.0004, 0.0020)
-    live_depth_quantization_m = 0.001
+    live_depth_noise_std_m = (0.0, 0.0002)
+    # Provisional documented D405/D400 profile. Device-specific plane captures
+    # will replace these ranges without changing the observation contract.
+    sim2real_randomization_profile = "d405_documented_provisional_v5:combined_sim2real"
+    live_correlated_depth_enabled = True
+    live_stereo_focal_length_px = _camera_cfg.fx
+    live_stereo_baseline_m = _camera_cfg.stereo_baseline_m
+    live_disparity_bias_px = (-0.04, 0.04)
+    live_disparity_independent_noise_std_px = (0.01, 0.03)
+    live_disparity_spatial_noise_std_px = (0.02, 0.07)
+    live_disparity_temporal_noise_std_px = (0.01, 0.04)
+    live_disparity_temporal_correlation = (0.60, 0.92)
+    live_stereo_edge_mismatch_probability = 0.12
+    live_stereo_edge_horizontal_radius_px = 2
+    live_depth_quantization_m = _camera_cfg.depth_unit_m
     live_depth_dropout_probability = (0.0, 0.004)
     live_depth_edge_dropout_probability = (0.0, 0.035)
     live_depth_edge_threshold_m = 0.008
     live_rgb_patch_occlusion_probability = 0.06
     live_depth_patch_dropout_probability = 0.04
     live_patch_area_fraction = (0.005, 0.03)
+    live_calibration_warp_enabled = True
+    live_calibration_shift_x_px = (-1.5, 1.5)
+    live_calibration_shift_y_px = (-1.0, 1.0)
+    live_calibration_scale = (0.99, 1.01)
+    live_calibration_roll_deg = (-1.0, 1.0)
+    live_clean_episode_fraction = 0.15
+    # Camera-frame and controller timing at 30 Hz. The completion hold is
+    # immediate; only live observations and six motion components are delayed.
+    live_observation_delay_max_steps = 2
+    live_observation_repeat_probability = 0.02
+    motion_action_delay_max_steps = 2
+    motion_action_two_step_probability = 0.08
+    motion_response_scale = (0.88, 1.12)
+    motion_response_alpha = (0.70, 1.0)
+    motion_bias = (-0.015, 0.015)
+    physics_joint_stiffness_scale = (0.90, 1.10)
+    physics_joint_damping_scale = (0.90, 1.10)
     # Change the physical live scene as well as applying sensor-space noise.
     # Rotating the distant key light changes the cast-shadow direction; the
     # slow cadence keeps each appearance stable for four seconds at 30 Hz.
     scene_appearance_randomization_enabled = True
     scene_appearance_randomization_interval_steps = 120
+    # A half-scale T-slot is canonical render/depth geometry. The exact
+    # collision surface remains the unchanged flat z=0 plane.
+    scene_tslot_surface_enabled = True
+    scene_tslot_geometry_randomization_enabled = True
+    scene_tslot_nominal_fraction = 0.60
+    scene_tslot_phase_fraction = 0.20
+    # Optional render/depth-only peripheral props. They deliberately carry no
+    # collision schema and sit outside the nominal target/approach corridor;
+    # PhysX continues to use the same flat z=0 workspace plane.
+    scene_clutter_enabled = False
+    scene_clutter_environment_fraction = 0.0
+    scene_clutter_min_objects = 1
+    scene_clutter_max_objects = 3
     scene_key_yaw_delta_deg = (-35.0, 35.0)
     scene_key_pitch_delta_deg = (-15.0, 15.0)
     scene_key_intensity_scale = (0.70, 1.30)
     scene_key_angle_deg = (5.0, 12.0)
     scene_dome_intensity_scale = (0.75, 1.25)
     scene_light_temperature_shift = (-0.08, 0.08)
-    scene_part_color_scale = (0.80, 1.20)
-    scene_part_hue_shift_deg = (-18.0, 18.0)
-    scene_part_roughness = (0.65, 0.95)
+    scene_part_color_scale = (0.90, 1.10)
+    scene_part_saturation_scale = (0.90, 1.10)
+    scene_part_hue_shift_deg = (-5.0, 5.0)
+    scene_part_roughness = (0.65, 0.90)
+    scene_tslot_color_scale = (0.88, 1.12)
+    scene_tslot_saturation_scale = (0.90, 1.10)
+    scene_tslot_hue_shift_deg = (-5.0, 5.0)
+    scene_tslot_roughness_delta = (-0.08, 0.08)
     scene_finger_color_scale = (0.80, 1.20)
     scene_ground_color_scale = (0.75, 1.25)
     scene_ground_hue_shift_deg = (-12.0, 12.0)
@@ -317,6 +365,17 @@ class GraspVisualServoEnvCfg_PLAY(GraspVisualServoEnvCfg):
     require_rotation_reset_data = False
     live_observation_randomization_enabled = False
     scene_appearance_randomization_enabled = False
+    scene_tslot_geometry_randomization_enabled = False
+    scene_tslot_surface_enabled = True
+    live_observation_delay_max_steps = 0
+    live_observation_repeat_probability = 0.0
+    motion_action_delay_max_steps = 0
+    motion_action_two_step_probability = 0.0
+    motion_response_scale = (1.0, 1.0)
+    motion_response_alpha = (1.0, 1.0)
+    motion_bias = (0.0, 0.0)
+    physics_joint_stiffness_scale = (1.0, 1.0)
+    physics_joint_damping_scale = (1.0, 1.0)
     completion_positive_reset_fraction = 0.0
     completion_probability_threshold = 0.95
     completion_required_consecutive_steps = 4
@@ -368,6 +427,17 @@ class GraspVisualServoMultiPartEnvCfg_PLAY(GraspVisualServoMultiPartEnvCfg):
     reset_position_fraction_max = 1.0
     live_observation_randomization_enabled = False
     scene_appearance_randomization_enabled = False
+    scene_tslot_geometry_randomization_enabled = False
+    scene_tslot_surface_enabled = True
+    live_observation_delay_max_steps = 0
+    live_observation_repeat_probability = 0.0
+    motion_action_delay_max_steps = 0
+    motion_action_two_step_probability = 0.0
+    motion_response_scale = (1.0, 1.0)
+    motion_response_alpha = (1.0, 1.0)
+    motion_bias = (0.0, 0.0)
+    physics_joint_stiffness_scale = (1.0, 1.0)
+    physics_joint_damping_scale = (1.0, 1.0)
     completion_positive_reset_fraction = 0.0
     training_reset_mixture_enabled = False
     training_curriculum_enabled = False

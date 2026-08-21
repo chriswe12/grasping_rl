@@ -7,6 +7,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+# Keep the external project importable when this file is launched directly by
+# Isaac Sim. Python otherwise puts only isaac_rl/scripts/rl_games on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from isaaclab.app import AppLauncher
 
@@ -87,6 +94,22 @@ parser.add_argument(
     default=None,
     help="Output directory. Defaults below the checkpoint run.",
 )
+parser.add_argument(
+    "--sim2real_profile",
+    choices=(
+        "nominal",
+        "sensor_only",
+        "camera_uncertainty",
+        "timing_control",
+        "appearance",
+        "combined_sim2real",
+        "combined_clutter",
+        "combined_depth_robust",
+        "stress_test",
+    ),
+    default="nominal",
+    help="Reproducible sensor/camera/timing/appearance evaluation profile.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
@@ -100,13 +123,18 @@ import json  # noqa: E402
 import math  # noqa: E402
 from collections import Counter, defaultdict  # noqa: E402
 from datetime import datetime  # noqa: E402
-from pathlib import Path  # noqa: E402
 from statistics import mean, median  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
 import isaac_rl.tasks  # noqa: E402, F401
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from grasp_planning.d405_wrist_camera import (  # noqa: E402
+    D405_VISUAL_SERVO_CAMERA_PROFILE,
+    D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+)
+from grasp_planning.rl.completion_diagnostics import CompletionDiagnostics  # noqa: E402
+from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile  # noqa: E402
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (  # noqa: E402
     register_grasp_completion_runner,
 )
@@ -176,6 +204,7 @@ def _build_report(
     rotation_deg: float,
     catalog_split: str,
     rows: list[dict[str, object]],
+    completion_diagnostics: dict[str, dict[str, object]],
 ) -> tuple[dict[str, object], list[dict[str, object]], str]:
     by_condition: dict[str, list[dict[str, object]]] = defaultdict(list)
     by_orientation: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
@@ -234,6 +263,7 @@ def _build_report(
         "orientations": orientations,
         "parts": {f"{condition}/{part_id}": _summarize(group) for (condition, part_id), group in by_part.items()},
         "targets": target_summaries,
+        "completion_diagnostics": completion_diagnostics,
     }
 
     lines = [
@@ -261,6 +291,35 @@ def _build_report(
             f"| {metrics['initial_rotation_error_deg_mean']:.2f} deg "
             f"| {metrics['final_position_error_mm_mean']:.2f} mm "
             f"| {metrics['final_rotation_error_deg_mean']:.2f} deg |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Completion-head diagnostics",
+            "",
+            (
+                "These per-step metrics use only unambiguous privileged labels during evaluation. "
+                "Precision and recall apply the raw probability threshold before the four-frame deployment hold."
+            ),
+            "",
+            (
+                "| Condition | Samples | Ready | Precision | Recall | False positive "
+                "| Brier | ECE | p(ready) | p(negative) |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for condition, metrics in completion_diagnostics.items():
+        lines.append(
+            f"| {condition} | {metrics['supervised_samples']} "
+            f"| {100.0 * metrics['positive_rate']:.2f}% "
+            f"| {100.0 * metrics['precision']:.2f}% "
+            f"| {100.0 * metrics['recall']:.2f}% "
+            f"| {100.0 * metrics['false_positive_rate']:.2f}% "
+            f"| {metrics['brier_score']:.4f} "
+            f"| {metrics['expected_calibration_error']:.4f} "
+            f"| {metrics['ready_probability_mean']:.3f} "
+            f"| {metrics['negative_probability_mean']:.3f} |"
         )
     lines.extend(
         [
@@ -306,10 +365,7 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
         raise ValueError("--runs_per_target must be at least one.")
     if args_cli.episode_seconds <= 0.0:
         raise ValueError("--episode_seconds must be positive.")
-    if hasattr(env_cfg, "live_observation_randomization_enabled"):
-        env_cfg.live_observation_randomization_enabled = False
-    if hasattr(env_cfg, "scene_appearance_randomization_enabled"):
-        env_cfg.scene_appearance_randomization_enabled = False
+    sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
     if any(
         value < 0.0
         for value in (
@@ -360,7 +416,10 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
         output_dir = (
             run_dir
             / "evaluations"
-            / (f"multigrasp_{env_cfg.catalog_split}_15s_{args_cli.runs_per_target}x_{rotation_label}_{stamp}")
+            / (
+                f"multigrasp_{env_cfg.catalog_split}_{args_cli.sim2real_profile}_"
+                f"15s_{args_cli.runs_per_target}x_{rotation_label}_{stamp}"
+            )
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -406,6 +465,9 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
     }
     conditions = tuple((condition, *available_conditions[condition]) for condition in args_cli.conditions)
     rows: list[dict[str, object]] = []
+    completion_threshold = float(task_env.cfg.completion_probability_threshold)
+    completion_diagnostics_overall = CompletionDiagnostics(threshold=completion_threshold)
+    completion_diagnostics_by_condition: dict[str, CompletionDiagnostics] = {}
     print(
         f"[EVAL] checkpoint={checkpoint} targets={task_env.target_count} "
         f"runs/target={args_cli.runs_per_target} horizon={max_steps} steps "
@@ -414,6 +476,8 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
     )
 
     for condition, progress_value, noise_rad in conditions:
+        condition_completion_diagnostics = CompletionDiagnostics(threshold=completion_threshold)
+        completion_diagnostics_by_condition[condition] = condition_completion_diagnostics
         task_env.cfg.reset_progress_min = progress_value
         task_env.cfg.reset_progress_max = progress_value
         task_env.cfg.reset_joint_noise_far_rad = noise_rad
@@ -489,6 +553,18 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                 final_rotation[active] = rotation_deg[active]
                 completion_probability = _cpu(evaluation["completion_probability"])
                 final_completion_probability[active] = completion_probability[active]
+                geometric_ready = _cpu(evaluation["geometric_ready"]).bool()
+                completion_supervised = _cpu(evaluation["completion_supervised"]).bool()
+                condition_completion_diagnostics.update(
+                    completion_probability[active].tolist(),
+                    geometric_ready[active].tolist(),
+                    completion_supervised[active].tolist(),
+                )
+                completion_diagnostics_overall.update(
+                    completion_probability[active].tolist(),
+                    geometric_ready[active].tolist(),
+                    completion_supervised[active].tolist(),
+                )
                 newly_done = active & done_cpu
                 if newly_done.any():
                     success = _cpu(evaluation["success"]).bool()
@@ -560,12 +636,20 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                 flush=True,
             )
 
+    completion_summaries = {
+        "overall": completion_diagnostics_overall.summary(),
+        **{
+            condition: diagnostics.summary()
+            for condition, diagnostics in completion_diagnostics_by_condition.items()
+        },
+    }
     payload, target_rows, markdown = _build_report(
         checkpoint=checkpoint,
         episode_seconds=args_cli.episode_seconds,
         rotation_deg=args_cli.rotation_deg,
         catalog_split=str(env_cfg.catalog_split),
         rows=rows,
+        completion_diagnostics=completion_summaries,
     )
     payload["seed"] = args_cli.seed
     payload["runs_per_target"] = args_cli.runs_per_target
@@ -575,6 +659,15 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
     payload["close_noise_rad"] = args_cli.close_noise_rad
     payload["rotation_deg"] = args_cli.rotation_deg
     payload["catalog_split"] = str(env_cfg.catalog_split)
+    payload["sim2real_profile"] = sim2real_profile.name
+    payload["sim2real_profile_id"] = sim2real_profile.identifier
+    payload["sim2real_profile_description"] = sim2real_profile.description
+    payload["sim2real_profile_overrides"] = dict(sim2real_profile.overrides)
+    payload["camera_profile"] = D405_VISUAL_SERVO_CAMERA_PROFILE
+    payload["observation_profile"] = D405_VISUAL_SERVO_OBSERVATION_PROFILE
+    for row in rows:
+        row["sim2real_profile"] = sim2real_profile.name
+    markdown = f"Sim-to-real profile: `{sim2real_profile.identifier}`  \n{sim2real_profile.description}\n\n" + markdown
     (output_dir / "summary.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
     _write_csv(output_dir / "episodes.csv", rows)
