@@ -53,6 +53,73 @@ def _fixed_joint_translation(urdf_root: ElementTree.Element, joint_name: str) ->
     return np.fromstring(origin.attrib.get("xyz", "0 0 0"), sep=" ")
 
 
+def _fixed_link_transform(
+    urdf_root: ElementTree.Element,
+    *,
+    ancestor_link: str,
+    descendant_link: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a fixed descendant pose expressed in an ancestor link."""
+
+    child_to_joint: dict[str, ElementTree.Element] = {}
+    for joint in urdf_root.findall("joint"):
+        child = joint.find("child")
+        if child is not None:
+            child_to_joint[str(child.get("link"))] = joint
+    chain: list[ElementTree.Element] = []
+    current = str(descendant_link)
+    while current != str(ancestor_link):
+        joint = child_to_joint.get(current)
+        if joint is None:
+            raise ValueError(
+                f"No fixed URDF chain from '{ancestor_link}' to '{descendant_link}'."
+            )
+        if str(joint.get("type")) != "fixed":
+            raise ValueError(
+                f"Transform chain to '{descendant_link}' crosses non-fixed joint "
+                f"'{joint.get('name')}'."
+            )
+        parent = joint.find("parent")
+        if parent is None:
+            raise ValueError(f"Joint '{joint.get('name')}' has no parent link.")
+        chain.append(joint)
+        current = str(parent.get("link"))
+
+    transform = np.eye(4, dtype=np.float64)
+    for joint in reversed(chain):
+        origin = joint.find("origin")
+        xyz = (
+            np.zeros(3, dtype=np.float64)
+            if origin is None
+            else np.fromstring(origin.attrib.get("xyz", "0 0 0"), sep=" ")
+        )
+        rpy = (
+            np.zeros(3, dtype=np.float64)
+            if origin is None
+            else np.fromstring(origin.attrib.get("rpy", "0 0 0"), sep=" ")
+        )
+        local = np.eye(4, dtype=np.float64)
+        local[:3, :3] = Rotation.from_euler("xyz", rpy).as_matrix()
+        local[:3, 3] = xyz
+        transform = transform @ local
+    return transform[:3, 3].copy(), transform[:3, :3].copy()
+
+
+def _robot_tcp_transform_link7(
+    urdf_root: ElementTree.Element,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Resolve the active KUKA gripper planner-TCP transform."""
+
+    links = {str(link.get("name")) for link in urdf_root.findall("link")}
+    tcp_link = "pdz_gripper_tcp" if "pdz_gripper_tcp" in links else "gripper_tcp"
+    position, rotation = _fixed_link_transform(
+        urdf_root,
+        ancestor_link="link7",
+        descendant_link=tcp_link,
+    )
+    return position, rotation, tcp_link
+
+
 def _sample_reference_joint_path(trajectory: np.ndarray, progress: float) -> np.ndarray:
     scaled = float(np.clip(progress, 0.0, 1.0)) * (trajectory.shape[0] - 1)
     lower = int(np.floor(scaled))
@@ -79,9 +146,38 @@ def _straight_cartesian_joint_path(
     if link7_id < 0:
         raise ValueError("Robot URDF did not produce a link7 MuJoCo body.")
     urdf_root = ElementTree.parse(robot_urdf).getroot()
-    tcp_offset_link7 = _fixed_joint_translation(
-        urdf_root, "gripper_mount_joint"
-    ) + _fixed_joint_translation(urdf_root, "gripper_tcp_joint")
+    tcp_offset_link7, tcp_rotation_link7, tcp_link = _robot_tcp_transform_link7(
+        urdf_root
+    )
+
+    # The stored MoveIt paths were planned with a TCP whose axes matched
+    # ``link7``.  The PDZ TCP is rotated -90 degrees about link7 Z.  KUKA A7 is
+    # the same local-Z rotation, so compensate the old path before using it as
+    # the numerical IK seed.  This leaves the requested world TCP pose
+    # unchanged and avoids starting the solver a quarter-turn from the valid
+    # branch.  Keep this generic for the identity legacy TCP and any other
+    # pure-Z tool rotation.
+    moveit_payload = plan.get("moveit", {})
+    planned_pose_link = (
+        str(moveit_payload.get("pose_link", "gripper_tcp"))
+        if isinstance(moveit_payload, dict)
+        else "gripper_tcp"
+    )
+    seed_compensation = (
+        np.zeros(3, dtype=np.float64)
+        if planned_pose_link == tcp_link
+        else Rotation.from_matrix(tcp_rotation_link7.T).as_rotvec()
+    )
+    if np.linalg.norm(seed_compensation[:2]) > 1.0e-8:
+        raise ValueError(
+            "The reset-path seed correction supports only a TCP rotation about "
+            f"link7 Z, got rotvec={seed_compensation.tolist()}."
+        )
+    reference_trajectory = raw_moveit_trajectory.copy()
+    reference_trajectory[:, 6] += float(seed_compensation[2])
+    reference_trajectory[:, 6] = (
+        reference_trajectory[:, 6] + np.pi
+    ) % (2.0 * np.pi) - np.pi
 
     selected_grasp = plan["selected_world_grasp"]
     if not isinstance(selected_grasp, dict):
@@ -97,8 +193,9 @@ def _straight_cartesian_joint_path(
     def pose_and_jacobian(q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data.qpos[:7] = q
         mujoco.mj_forward(model, data)
-        rotation = data.xmat[link7_id].reshape(3, 3).copy()
-        position = data.xpos[link7_id].copy() + rotation @ tcp_offset_link7
+        link7_rotation = data.xmat[link7_id].reshape(3, 3).copy()
+        position = data.xpos[link7_id].copy() + link7_rotation @ tcp_offset_link7
+        rotation = link7_rotation @ tcp_rotation_link7
         jacobian_position = np.zeros((3, model.nv), dtype=np.float64)
         jacobian_rotation = np.zeros((3, model.nv), dtype=np.float64)
         mujoco.mj_jac(
@@ -121,7 +218,7 @@ def _straight_cartesian_joint_path(
     maximum_position_error = 0.0
     maximum_rotation_error = 0.0
     for progress, target_position in zip(progress_values, target_positions, strict=True):
-        reference = _sample_reference_joint_path(raw_moveit_trajectory, float(progress))
+        reference = _sample_reference_joint_path(reference_trajectory, float(progress))
         q = reference.copy()
         for _ in range(200):
             position, rotation, jacobian = pose_and_jacobian(q)

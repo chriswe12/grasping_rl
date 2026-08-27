@@ -41,14 +41,17 @@ from grasp_planning.rl.live_observation_randomization import (
     LiveObservationRandomizationCfg,
     LiveObservationRandomizer,
 )
+from grasp_planning.rl.policy_context import assemble_policy_context_torch, resolve_policy_context
+from grasp_planning.rl.policy_timing import temporal_reward_scale
 from grasp_planning.rl.scene_appearance_randomization import (
     SceneAppearanceRandomizationCfg,
     SceneAppearanceRandomizer,
 )
 from grasp_planning.start_poses import (
-    KUKA_Y_GRIPPER_APPROACH_PROFILE,
-    KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M,
+    PDZ_GRIPPER_APPROACH_PROFILE,
+    PDZ_GRIPPER_OPEN_WIDTH_M,
 )
+from grasp_planning.visual_servo_busy_background import spawn_visual_servo_busy_background
 from grasp_planning.visual_servo_clutter import spawn_visual_servo_clutter
 from grasp_planning.visual_servo_workspace import (
     VISUAL_SERVO_TSLOT_PROFILE,
@@ -73,6 +76,11 @@ from .multigrasp_catalog import (
     load_multigrasp_catalog,
     load_multigrasp_rotation_resets,
     select_catalog_split,
+)
+from .object_pose_sampling import (
+    apply_planar_object_pose_delta,
+    sample_collision_safe_yaw_offsets_from_profile,
+    yaw_offset_profile,
 )
 from .reset_position_sampling import (
     position_offset_profile,
@@ -109,6 +117,7 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.visual_light_paths: dict[str, str] = {}
         self.tslot_visual_bindings: dict[str, object] = {}
         self.clutter_visual_bindings: dict[str, object] = {}
+        self.busy_background_visual_bindings: dict[str, object] = {}
         super().__init__(cfg, render_mode, **kwargs)
         self.visual_material_bindings = apply_visual_servo_materials()
         if self.cfg.scene_appearance_randomization_enabled:
@@ -157,7 +166,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             robot=self.robot,
             scene=self.scene,
             sim=self.sim,
-            fixed_gripper_width=0.084,
+            fixed_gripper_width=PDZ_GRIPPER_OPEN_WIDTH_M,
         )
         self.arm_ids = self.context.arm_joint_ids
         self.previous_actions = torch.zeros((self.num_envs, 6), device=self.device)
@@ -204,6 +213,10 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.reset_position_offset = torch.zeros((self.num_envs, 3), device=self.device)
         self.reset_position_requested = torch.zeros(self.num_envs, device=self.device)
         self.reset_position_safe_cap = torch.zeros(self.num_envs, device=self.device)
+        self.reset_object_yaw_offset = torch.zeros(self.num_envs, device=self.device)
+        self.reset_object_yaw_requested = torch.zeros(self.num_envs, device=self.device)
+        self.reset_object_yaw_safe_cap = torch.zeros(self.num_envs, device=self.device)
+        self.reset_goal_position_delta = torch.zeros((self.num_envs, 3), device=self.device)
         self.initial_position_error = torch.zeros(self.num_envs, device=self.device)
         self.initial_rotation_error = torch.zeros(self.num_envs, device=self.device)
         self.curriculum_fraction = 0.0
@@ -270,12 +283,12 @@ class GraspVisualServoEnv(DirectRLEnv):
             )
             complete_target_ids = tuple(str(value) for value in complete_catalog["target_ids"].tolist())
             approach_profile = str(np.asarray(complete_catalog.get("approach_gripper_profile", "")).item())
-            if approach_profile != KUKA_Y_GRIPPER_APPROACH_PROFILE:
+            if approach_profile != PDZ_GRIPPER_APPROACH_PROFILE:
                 raise ValueError(
                     "Goal catalog approach-gripper mismatch: "
                     f"catalog='{approach_profile or 'unlabeled'}', "
-                    f"environment='{KUKA_Y_GRIPPER_APPROACH_PROFILE}'. Rebuild the "
-                    "path asset and re-capture every Isaac goal image before training "
+                    f"environment='{PDZ_GRIPPER_APPROACH_PROFILE}'. Rebuild the "
+                    "path asset and re-render every MuJoCo goal image before training "
                     "or playback."
                 )
             material_profile = str(np.asarray(complete_catalog.get("visual_material_profile", "")).item())
@@ -284,7 +297,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                     "Goal catalog visual material mismatch: "
                     f"catalog='{material_profile or 'unlabeled'}', "
                     f"environment='{VISUAL_SERVO_MATERIAL_PROFILE}'. Re-capture the "
-                    "Isaac goal RGB-D catalog before training or playback."
+                    "MuJoCo goal RGB-D catalog before training or playback."
                 )
             scene_profile = str(np.asarray(complete_catalog.get("visual_scene_profile", "")).item())
             if scene_profile != VISUAL_SERVO_SCENE_PROFILE:
@@ -355,6 +368,18 @@ class GraspVisualServoEnv(DirectRLEnv):
             raise ValueError(
                 f"Catalog part_names={self.part_names} do not match configured scene parts={configured_part_names}."
             )
+        configured_rotation_radii = tuple(float(value) for value in self.cfg.part_xy_rotation_radii_m)
+        if len(configured_rotation_radii) != len(self.part_names) or any(
+            value <= 0.0 for value in configured_rotation_radii
+        ):
+            raise ValueError(
+                "part_xy_rotation_radii_m must contain one positive radius for every configured part."
+            )
+        self.part_xy_rotation_radii = torch.as_tensor(
+            configured_rotation_radii,
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.fixed_target_index = int(self.cfg.fixed_target_index)
         if str(self.cfg.fixed_target_id):
             if self.fixed_target_index >= 0:
@@ -510,9 +535,13 @@ class GraspVisualServoEnv(DirectRLEnv):
                 "rotation randomization is disabled for this playback.",
                 flush=True,
             )
-        if self.cfg.reset_position_randomization_enabled and self.rotation_reset_collision_clearance is None:
+        if (
+            self.cfg.reset_position_randomization_enabled
+            or self.cfg.reset_object_yaw_randomization_enabled
+        ) and self.rotation_reset_collision_clearance is None:
             raise ValueError(
-                "Position reset randomization requires a rotation-reset asset with per-state collision clearances."
+                "Object-pose reset randomization requires a rotation-reset asset with per-state "
+                "collision clearances."
             )
 
     def _legacy_single_goal_catalog(self) -> dict[str, np.ndarray]:
@@ -551,7 +580,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             "goal_tcp_orientations_xyzw_w": np.asarray([goal_tcp_quaternion_xyzw], dtype=np.float32),
             "reset_joint_trajectories": trajectory[None, ...],
             "reset_path_progress": np.linspace(0.0, 1.0, trajectory.shape[0], dtype=np.float32),
-            "approach_gripper_widths_m": np.asarray([KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M], dtype=np.float32),
+            "approach_gripper_widths_m": np.asarray([PDZ_GRIPPER_OPEN_WIDTH_M], dtype=np.float32),
             "moveit_plan_validated": np.ones(1, dtype=np.bool_),
             "isaac_goal_rgbd_captured": np.ones(1, dtype=np.bool_),
         }
@@ -581,7 +610,11 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.debug_camera = TiledCamera(self.cfg.debug_camera) if self.cfg.debug_camera_enabled else None
         self.gripper_contact_sensor = ContactSensor(
             ContactSensorCfg(
-                prim_path=("/World/envs/env_.*/Robot/(gripper_base_link|left_finger_link|right_finger_link)"),
+                prim_path=(
+                    "/World/envs/env_.*/Robot/(gripper_base_link|left_finger_link|"
+                    "right_finger_link|pdz_gripper_base_link|"
+                    "pdz_gripper_left_finger_link|pdz_gripper_right_finger_link)"
+                ),
                 update_period=0.0,
                 history_length=1,
                 debug_vis=False,
@@ -609,6 +642,14 @@ class GraspVisualServoEnv(DirectRLEnv):
             min_objects=int(self.cfg.scene_clutter_min_objects),
             max_objects=int(self.cfg.scene_clutter_max_objects),
         )
+        self.busy_background_visual_bindings = spawn_visual_servo_busy_background(
+            self.num_envs,
+            enabled=bool(self.cfg.scene_busy_background_enabled),
+            seed=int(self.cfg.seed) + 20_003,
+            environment_fraction=float(self.cfg.scene_busy_background_environment_fraction),
+            min_people=int(self.cfg.scene_busy_background_min_people),
+            max_people=int(self.cfg.scene_busy_background_max_people),
+        )
         self.scene.articulations["robot"] = self.robot
         for part_index, part in enumerate(self.parts):
             key = "part" if len(self.parts) == 1 else f"part_{part_index}"
@@ -633,6 +674,42 @@ class GraspVisualServoEnv(DirectRLEnv):
         return torch.bmm(
             matrix_from_quat(tcp_quaternion),
             self.rotation_tcp_from_camera.expand(tcp_quaternion.shape[0], -1, -1),
+        )
+
+    def _policy_context(self, tcp_quaternion: torch.Tensor) -> torch.Tensor:
+        """Return actor context that can be reproduced from the real pose stream."""
+
+        mode = str(self.cfg.policy_context_mode)
+        spec = resolve_policy_context(mode)
+        if not spec.uses_tcp_twist:
+            return self.previous_actions
+
+        rotation_world_from_camera = self._rotation_world_from_camera(tcp_quaternion)
+        rotation_camera_from_world = rotation_world_from_camera.transpose(1, 2)
+        body_velocity_world = self.robot.data.body_link_vel_w[:, self.context.ee_body_idx]
+        twist_camera = torch.cat(
+            (
+                torch.bmm(rotation_camera_from_world, body_velocity_world[:, :3, None]).squeeze(-1),
+                torch.bmm(rotation_camera_from_world, body_velocity_world[:, 3:, None]).squeeze(-1),
+            ),
+            dim=-1,
+        )
+        normalized_twist_camera = torch.cat(
+            (
+                twist_camera[:, :3] / float(self.cfg.linear_action_scale_m_s),
+                twist_camera[:, 3:] / float(self.cfg.angular_action_scale_rad_s),
+            ),
+            dim=-1,
+        ).clamp(-5.0, 5.0)
+        rotation_base_from_camera = None
+        if spec.uses_camera_rotation:
+            rotation_base_from_world = matrix_from_quat(quat_conjugate(self.robot.data.root_quat_w))
+            rotation_base_from_camera = torch.bmm(rotation_base_from_world, rotation_world_from_camera)
+        return assemble_policy_context_torch(
+            mode,
+            self.previous_actions,
+            normalized_tcp_twist_camera=normalized_twist_camera,
+            rotation_base_from_camera=rotation_base_from_camera,
         )
 
     def _gripper_contact_force(self) -> torch.Tensor:
@@ -885,7 +962,7 @@ class GraspVisualServoEnv(DirectRLEnv):
         qd = self.robot.data.joint_vel[:, self.arm_ids]
         state = torch.cat((q, qd, position_error, rotation_error, self.previous_actions), dim=-1)
         visual_observation = self._camera_observation().flatten(start_dim=1)
-        # The preceding action is deployment-available policy context. The
+        # The actor context contains only deployment-available values. The
         # normalized pose/completion values are privileged labels: RL-Games
         # stores them in the rollout, but the custom actor slices them away
         # before computing any action.
@@ -913,10 +990,11 @@ class GraspVisualServoEnv(DirectRLEnv):
             collision_free=~self._gripper_collision(),
         )
         completion_target = torch.stack((labels.ready.float(), labels.supervised.float()), dim=-1)
+        policy_context = self._policy_context(tcp_quaternion)
         policy_observation = torch.cat(
             (
                 visual_observation,
-                self.previous_actions,
+                policy_context,
                 pose_target,
                 completion_target,
             ),
@@ -983,10 +1061,14 @@ class GraspVisualServoEnv(DirectRLEnv):
             .clamp(0.0, 1.0)
             .square()
         )
-        reward -= self.cfg.collision_risk_penalty_weight * collision_risk
-        reward -= self.cfg.step_penalty
+        # These are costs per unit time rather than potentials. Scale them by
+        # the actual policy period so changing 30 Hz to 15 Hz does not silently
+        # halve the objective's action/hold/contact cost per simulated second.
+        time_cost_scale = temporal_reward_scale(self.step_dt)
+        reward -= time_cost_scale * self.cfg.collision_risk_penalty_weight * collision_risk
+        reward -= time_cost_scale * self.cfg.step_penalty
         action_norm = torch.linalg.norm(self.actions, dim=-1)
-        reward -= self.cfg.action_penalty_weight * action_norm.square()
+        reward -= time_cost_scale * self.cfg.action_penalty_weight * action_norm.square()
         self.previous_position_error.copy_(position_norm)
         self.previous_rotation_error.copy_(rotation_norm)
         terminal = self.completion_declaration | diverged | collision | timed_out
@@ -1032,6 +1114,15 @@ class GraspVisualServoEnv(DirectRLEnv):
             "reset_position_requested_mm": self.reset_position_requested.mean() * 1000.0,
             "reset_position_capped_rate": (
                 torch.linalg.norm(self.reset_position_offset, dim=-1) + 1.0e-9 < self.reset_position_requested
+            )
+            .float()
+            .mean(),
+            "reset/object_yaw_deg": self.reset_object_yaw_offset.abs().mean() * 180.0 / torch.pi,
+            "reset/object_yaw_requested_deg": (
+                self.reset_object_yaw_requested.mean() * 180.0 / torch.pi
+            ),
+            "reset/object_yaw_capped_rate": (
+                self.reset_object_yaw_offset.abs() + 1.0e-9 < self.reset_object_yaw_requested
             )
             .float()
             .mean(),
@@ -1098,6 +1189,24 @@ class GraspVisualServoEnv(DirectRLEnv):
                         float(self.clutter_visual_bindings.get("active_environment_count", 0))
                         / float(self.num_envs)
                     ),
+                    "appearance/busy_background_environment_fraction": position_norm.new_tensor(
+                        float(self.busy_background_visual_bindings.get("active_environment_count", 0))
+                        / float(self.num_envs)
+                    ),
+                    "appearance/busy_background_people_per_environment": position_norm.new_tensor(
+                        float(self.busy_background_visual_bindings.get("people_count", 0))
+                        / float(self.num_envs)
+                    ),
+                    "appearance/busy_background_worker_reaches_per_environment": (
+                        position_norm.new_tensor(
+                            float(
+                                self.busy_background_visual_bindings.get(
+                                    "worker_reach_count", 0
+                                )
+                            )
+                            / float(self.num_envs)
+                        )
+                    ),
                 }
             )
         # Preserve per-environment terminal measurements for batched policy
@@ -1114,6 +1223,10 @@ class GraspVisualServoEnv(DirectRLEnv):
             "reset_position_offset_w": self.reset_position_offset.clone(),
             "reset_position_requested_m": self.reset_position_requested.clone(),
             "reset_position_safe_cap_m": self.reset_position_safe_cap.clone(),
+            "reset_object_yaw_offset_rad": self.reset_object_yaw_offset.clone(),
+            "reset_object_yaw_requested_rad": self.reset_object_yaw_requested.clone(),
+            "reset_object_yaw_safe_cap_rad": self.reset_object_yaw_safe_cap.clone(),
+            "reset_goal_position_delta_w": self.reset_goal_position_delta.clone(),
             "completion_positive_reset": self.completion_positive_reset.clone(),
             "completion_exact_reset": self.completion_exact_reset.clone(),
             "reset_mode": self.reset_mode.clone(),
@@ -1382,10 +1495,19 @@ class GraspVisualServoEnv(DirectRLEnv):
         position_offset = torch.zeros((count, 3), dtype=torch.float32, device=self.device)
         position_requested = torch.zeros(count, dtype=torch.float32, device=self.device)
         position_safe_cap = torch.zeros(count, dtype=torch.float32, device=self.device)
-        if self.cfg.reset_position_randomization_enabled:
+        object_yaw_offset = torch.zeros(count, dtype=torch.float32, device=self.device)
+        object_yaw_requested = torch.zeros(count, dtype=torch.float32, device=self.device)
+        object_yaw_safe_cap = torch.zeros(count, dtype=torch.float32, device=self.device)
+        selected_part_indices = self.target_part_indices[target_indices]
+        selected_clearance: torch.Tensor | None = None
+        object_pose_randomization_enabled = bool(
+            self.cfg.reset_position_randomization_enabled
+            or self.cfg.reset_object_yaw_randomization_enabled
+        )
+        if object_pose_randomization_enabled:
             if not collision_safe_sampling or progress_indices is None or variant_indices is None:
                 raise ValueError(
-                    "Position reset randomization requires exact collision-validated "
+                    "Object-pose reset randomization requires exact collision-validated "
                     "waypoint and rotation-variant sampling."
                 )
             if self.rotation_reset_collision_clearance is None or self.nominal_reset_collision_clearance is None:
@@ -1399,6 +1521,10 @@ class GraspVisualServoEnv(DirectRLEnv):
                 rotated_clearance,
                 nominal_clearance,
             )
+
+        if self.cfg.reset_position_randomization_enabled:
+            if selected_clearance is None:
+                raise RuntimeError("Collision clearance was not selected for object translation.")
             requested_profile = position_offset_profile(
                 progress,
                 far_offset_m=float(self.cfg.reset_position_far_offset_m),
@@ -1433,20 +1559,77 @@ class GraspVisualServoEnv(DirectRLEnv):
                 magnitude_unit_samples=magnitude_samples,
             )
 
-        # Shift the active object and its final TCP goal together. The robot
-        # remains at the validated nominal/rotated waypoint, creating a true
-        # off-path Cartesian error while preserving the canonical goal image.
-        self.goal_tcp_position[env_ids] = (
-            self.goal_tcp_positions_catalog[target_indices] + position_offset + self.scene.env_origins[env_ids]
+        if self.cfg.reset_object_yaw_randomization_enabled:
+            if selected_clearance is None:
+                raise RuntimeError("Collision clearance was not selected for object yaw.")
+            if not (
+                0.0
+                <= float(self.cfg.reset_object_yaw_fraction_min)
+                <= float(self.cfg.reset_object_yaw_fraction_max)
+                <= 1.0
+            ):
+                raise ValueError("Object-yaw reset fractions must satisfy 0 <= min <= max <= 1.")
+            requested_yaw_profile = yaw_offset_profile(
+                progress,
+                far_yaw_rad=float(self.cfg.reset_object_yaw_far_rad),
+                near_yaw_rad=float(self.cfg.reset_object_yaw_near_rad),
+                exponent=float(self.cfg.reset_object_yaw_exponent),
+            )
+            yaw_fraction_samples = torch.empty(count, device=self.device).uniform_(
+                float(self.cfg.reset_object_yaw_fraction_min),
+                float(self.cfg.reset_object_yaw_fraction_max),
+            )
+            yaw_zero_offset = positive_reset
+            if self.cfg.training_reset_mixture_enabled:
+                path_reset = reset_modes == RESET_MODE_PATH
+                requested_yaw_profile = torch.where(
+                    path_reset,
+                    requested_yaw_profile * curriculum.perturbation_scale,
+                    torch.zeros_like(requested_yaw_profile),
+                )
+                yaw_zero_offset = ~path_reset
+            object_yaw_offset, object_yaw_requested, object_yaw_safe_cap = (
+                sample_collision_safe_yaw_offsets_from_profile(
+                    requested_yaw_profile,
+                    selected_clearance,
+                    torch.linalg.norm(position_offset, dim=-1),
+                    self.part_xy_rotation_radii[selected_part_indices],
+                    yaw_zero_offset,
+                    minimum_collision_clearance_m=(self.rotation_reset_minimum_collision_clearance_m),
+                    clearance_guard_m=float(self.cfg.reset_position_clearance_guard_m),
+                    magnitude_unit_samples=yaw_fraction_samples,
+                )
+            )
+
+        # Apply one rigid planar delta to the physical object and the final TCP
+        # target expressed in its part frame. The robot remains at the exact
+        # validated waypoint and the canonical goal RGB-D remains unchanged.
+        nominal_object_position = self.object_positions_catalog[target_indices]
+        nominal_object_quaternion = self.object_quaternions_catalog[target_indices]
+        nominal_goal_position = self.goal_tcp_positions_catalog[target_indices]
+        nominal_goal_quaternion = self.goal_tcp_quaternions_catalog[target_indices]
+        (
+            moved_object_position,
+            moved_object_quaternion,
+            moved_goal_position,
+            moved_goal_quaternion,
+        ) = apply_planar_object_pose_delta(
+            nominal_object_position,
+            nominal_object_quaternion,
+            nominal_goal_position,
+            nominal_goal_quaternion,
+            position_offset,
+            object_yaw_offset,
         )
+        self.goal_tcp_position[env_ids] = moved_goal_position + self.scene.env_origins[env_ids]
+        self.goal_tcp_quaternion[env_ids] = moved_goal_quaternion
         object_pose = torch.cat(
             (
-                self.object_positions_catalog[target_indices] + position_offset + self.scene.env_origins[env_ids],
-                self.object_quaternions_catalog[target_indices],
+                moved_object_position + self.scene.env_origins[env_ids],
+                moved_object_quaternion,
             ),
             dim=-1,
         )
-        selected_part_indices = self.target_part_indices[target_indices]
         zero_velocity = torch.zeros((count, 6), dtype=torch.float32, device=self.device)
         parked_pose = torch.zeros((count, 7), dtype=torch.float32, device=self.device)
         parked_pose[:, :3] = self.scene.env_origins[env_ids]
@@ -1496,6 +1679,10 @@ class GraspVisualServoEnv(DirectRLEnv):
         self.reset_position_offset[env_ids] = position_offset
         self.reset_position_requested[env_ids] = position_requested
         self.reset_position_safe_cap[env_ids] = position_safe_cap
+        self.reset_object_yaw_offset[env_ids] = object_yaw_offset
+        self.reset_object_yaw_requested[env_ids] = object_yaw_requested
+        self.reset_object_yaw_safe_cap[env_ids] = object_yaw_safe_cap
+        self.reset_goal_position_delta[env_ids] = moved_goal_position - nominal_goal_position
         if self.cfg.variable_reset_timeouts_enabled:
             timeout_s = reset_timeout_seconds(
                 progress,

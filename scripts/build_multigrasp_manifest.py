@@ -67,6 +67,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-width-clearance", type=float, default=0.01)
     parser.add_argument("--max-training-jaw-width", type=float, default=0.075)
     parser.add_argument("--minimum-pregrasp-height", type=float, default=0.05)
+    parser.add_argument(
+        "--object-xy-world",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("X", "Y"),
+        help="Override the source stage-2 XY while preserving each stable support pose.",
+    )
     parser.add_argument("--alternates-per-orientation", type=int, default=20)
     return parser.parse_args()
 
@@ -229,7 +237,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
     mesh_global = load_asset_mesh(stage1.target_mesh_path, scale=stage1.mesh_scale)
     mesh_local = _mesh_in_source_frame(mesh_global, _source_frame_pose_from_bundle(stage1))
     stable_result = enumerate_stable_orientations(mesh_local, StableOrientationConfig())
-    object_xy = current_pose.position_world[:2]
+    object_xy = (
+        tuple(float(value) for value in args.object_xy_world)
+        if getattr(args, "object_xy_world", None) is not None
+        else current_pose.position_world[:2]
+    )
     orientation_poses: list[tuple[str, ObjectWorldPose, dict[str, object]]] = [
         (
             "current",
@@ -265,9 +277,15 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         if args.target_count > 0
         else int(targets_per_orientation_cap)
     )
+    gripper_collision_model = str(
+        stage1.metadata.get("gripper_model", "kuka_y_gripper")
+    )
+    detailed_contact_gap_m = (
+        0.005 if gripper_collision_model == "pdz_gripper" else 0.002
+    )
     planning = PlanningConfig(
-        detailed_finger_contact_gap_m=0.002,
-        gripper_collision_model="kuka_y_gripper",
+        detailed_finger_contact_gap_m=detailed_contact_gap_m,
+        gripper_collision_model=gripper_collision_model,
         floor_clearance_margin_m=0.01,
         top_grasp_score_weight=0.35,
         reachability_proxy_score_weight=0.15,
@@ -365,6 +383,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
             "method": "balanced_score_seeded_farthest_point",
             "moveit_validation_required": True,
             "isaac_goal_capture_required": True,
+            "gripper_collision_model": gripper_collision_model,
         },
         "orientations": orientation_records,
         "targets": selected_targets,

@@ -45,11 +45,18 @@ parser.add_argument(
         "appearance",
         "combined_sim2real",
         "combined_clutter",
+        "combined_busy_background",
         "combined_depth_robust",
         "stress_test",
     ),
     default=None,
     help="Apply one full-strength named profile for runtime diagnostics.",
+)
+parser.add_argument(
+    "--policy-context",
+    choices=("action", "action_twist", "action_twist_rotation"),
+    default="action",
+    help="Deployment-measurable actor context to validate.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -59,6 +66,11 @@ app = AppLauncher(args).app
 import gymnasium as gym
 import isaac_rl.tasks  # noqa: F401,E402
 import torch
+from grasp_planning.d405_wrist_camera import (
+    VISUAL_SERVO_OBSERVATION_HEIGHT,
+    VISUAL_SERVO_OBSERVATION_WIDTH,
+)
+from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
 
 from isaaclab_tasks.utils import parse_env_cfg
@@ -72,6 +84,17 @@ cfg = parse_env_cfg(
     num_envs=args.num_envs,
 )
 cfg.seed = 7
+context_spec = resolve_policy_context(args.policy_context)
+cfg.policy_context_mode = context_spec.name
+cfg.observation_space = policy_observation_size(
+    context_spec.name,
+    image_value_count=VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8,
+)
+print(
+    f"[SMOKE] policy_context={context_spec.name} context_size={context_spec.size} "
+    f"observation_size={cfg.observation_space}",
+    flush=True,
+)
 if args.sim2real_profile is not None:
     profile = apply_sim2real_profile(cfg, args.sim2real_profile)
     # A smoke test must exercise the selected profile immediately instead of
@@ -87,7 +110,8 @@ env = gym.make(task_id, cfg=cfg)
 observation, _ = env.reset()
 print(
     f"[SMOKE] policy={tuple(observation['policy'].shape)} "
-    f"critic={tuple(observation['critic'].shape)} action={env.action_space.shape}",
+    f"critic={tuple(observation['critic'].shape)} action={env.action_space.shape} "
+    f"policy_rate_hz={1.0 / float(env.unwrapped.step_dt):.1f}",
     flush=True,
 )
 print(
@@ -115,6 +139,15 @@ print(
     f"clutter_objects={len(clutter['prim_paths'])}",
     flush=True,
 )
+background = env.unwrapped.busy_background_visual_bindings
+print(
+    f"[SMOKE] busy_background_profile={background['profile']} "
+    f"background_active_environments={background['active_environment_count']}/"
+    f"{env.unwrapped.num_envs} standing_people={background['people_count']} "
+    f"table_edge_coworkers={background['worker_reach_count']} "
+    f"styles={background['style_counts']}",
+    flush=True,
+)
 target_indices = env.unwrapped.target_index.detach().cpu().tolist()
 target_ids = [env.unwrapped.target_ids[index] for index in target_indices]
 print(
@@ -131,10 +164,14 @@ print(
 initial_rotation_deg = torch.rad2deg(env.unwrapped.initial_rotation_error.detach())
 reset_rotation_deg = torch.rad2deg(env.unwrapped.reset_rotation_command.detach())
 reset_position_mm = torch.linalg.norm(env.unwrapped.reset_position_offset.detach(), dim=-1) * 1000.0
+reset_object_yaw_deg = torch.rad2deg(env.unwrapped.reset_object_yaw_offset.detach())
 print(
     f"[SMOKE] authored_position_offset_mm="
     f"mean={float(reset_position_mm.mean()):.2f} "
     f"range=[{float(reset_position_mm.min()):.2f}, {float(reset_position_mm.max()):.2f}] "
+    f"object_yaw_deg="
+    f"mean_abs={float(reset_object_yaw_deg.abs().mean()):.2f} "
+    f"range=[{float(reset_object_yaw_deg.min()):.2f}, {float(reset_object_yaw_deg.max()):.2f}] "
     f"authored_rotation_deg="
     f"mean={float(reset_rotation_deg.mean()):.2f} "
     f"range=[{float(reset_rotation_deg.min()):.2f}, {float(reset_rotation_deg.max()):.2f}] "

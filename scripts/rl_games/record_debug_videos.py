@@ -16,7 +16,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
     "--task",
-    default="Grasp-Visual-Servo-RGBD-Direct-Play-v0",
+    default="Grasp-Visual-Servo-RGBD-MultiPart-Direct-Play-v0",
     help="Registered Isaac Lab visual-servo play task.",
 )
 parser.add_argument("--agent", default="rl_games_cfg_entry_point")
@@ -39,6 +39,37 @@ parser.add_argument(
     help=("Optional target index per condition. If omitted, every episode draws an independent random catalog target."),
 )
 parser.add_argument("--catalog_split", choices=("train", "validation", "test", "all"), default="all")
+parser.add_argument(
+    "--sim2real_profile",
+    choices=(
+        "nominal",
+        "sensor_only",
+        "camera_uncertainty",
+        "timing_control",
+        "appearance",
+        "combined_sim2real",
+        "combined_clutter",
+        "combined_busy_background",
+        "combined_depth_robust",
+        "stress_test",
+    ),
+    default="nominal",
+    help="Reproducible sensor/camera/timing/appearance profile used for the recorded policy input.",
+)
+parser.add_argument(
+    "--policy-context",
+    choices=("action", "action_twist", "action_twist_rotation"),
+    default="action",
+    help="Actor context contract used by the checkpoint.",
+)
+parser.add_argument(
+    "--force_profile_effects",
+    action="store_true",
+    help=(
+        "Disable the clean-episode mixture and, for clutter profiles, place clutter in the single "
+        "debug environment so the requested profile is visible in every diagnostic video."
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
@@ -55,6 +86,12 @@ import gymnasium as gym  # noqa: E402
 import isaac_rl.tasks  # noqa: E402, F401
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from grasp_planning.d405_wrist_camera import (  # noqa: E402
+    VISUAL_SERVO_OBSERVATION_HEIGHT,
+    VISUAL_SERVO_OBSERVATION_WIDTH,
+)
+from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context  # noqa: E402
+from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile  # noqa: E402
 from grasp_planning.video import OpenCvVideoWriter  # noqa: E402
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (  # noqa: E402
     register_grasp_completion_runner,
@@ -85,15 +122,57 @@ class DebugFrame:
 
 
 CONDITIONS = {
-    "far": {"progress": 0.0, "noise_rad": 0.0, "rotation_fraction": 1.0, "position_fraction": 1.0},
-    "mid": {"progress": 0.50, "noise_rad": 0.0, "rotation_fraction": 1.0, "position_fraction": 1.0},
-    "close": {"progress": 0.85, "noise_rad": 0.0, "rotation_fraction": 1.0, "position_fraction": 1.0},
-    "far_clean": {"progress": 0.0, "noise_rad": 0.0, "rotation_fraction": 0.0, "position_fraction": 0.0},
-    "mid_clean": {"progress": 0.50, "noise_rad": 0.0, "rotation_fraction": 0.0, "position_fraction": 0.0},
-    "close_clean": {"progress": 0.85, "noise_rad": 0.0, "rotation_fraction": 0.0, "position_fraction": 0.0},
+    "far": {
+        "progress": 0.0,
+        "noise_rad": 0.0,
+        "rotation_fraction": 1.0,
+        "position_fraction": 1.0,
+        "object_yaw_fraction": 1.0,
+    },
+    "mid": {
+        "progress": 0.50,
+        "noise_rad": 0.0,
+        "rotation_fraction": 1.0,
+        "position_fraction": 1.0,
+        "object_yaw_fraction": 1.0,
+    },
+    "close": {
+        "progress": 0.85,
+        "noise_rad": 0.0,
+        "rotation_fraction": 1.0,
+        "position_fraction": 1.0,
+        "object_yaw_fraction": 1.0,
+    },
+    "far_clean": {
+        "progress": 0.0,
+        "noise_rad": 0.0,
+        "rotation_fraction": 0.0,
+        "position_fraction": 0.0,
+        "object_yaw_fraction": 0.0,
+    },
+    "mid_clean": {
+        "progress": 0.50,
+        "noise_rad": 0.0,
+        "rotation_fraction": 0.0,
+        "position_fraction": 0.0,
+        "object_yaw_fraction": 0.0,
+    },
+    "close_clean": {
+        "progress": 0.85,
+        "noise_rad": 0.0,
+        "rotation_fraction": 0.0,
+        "position_fraction": 0.0,
+        "object_yaw_fraction": 0.0,
+    },
     # A zero-action exact final-path state for proving that the stored goal is
     # rendered with the same camera, materials, robot, and open fingers.
-    "exact": {"progress": 1.0, "noise_rad": 0.0, "rotation_fraction": 0.0, "position_fraction": 0.0},
+    "exact": {
+        "progress": 1.0,
+        "noise_rad": 0.0,
+        "rotation_fraction": 0.0,
+        "position_fraction": 0.0,
+        "object_yaw_fraction": 0.0,
+    },
 }
 
 
@@ -185,6 +264,7 @@ def _compose_frame(
     noise_rad: float,
     rotation_command_deg: float,
     position_offset_mm: float,
+    object_yaw_deg: float,
     initial_position_mm: float,
     initial_rotation_deg: float,
     final_position_mm: float,
@@ -192,13 +272,17 @@ def _compose_frame(
     best_position_mm: float,
     best_rotation_deg: float,
     termination: str,
+    sim2real_profile: str,
 ) -> np.ndarray:
     canvas = Image.new("RGB", (1600, 900), (12, 15, 20))
     draw = ImageDraw.Draw(canvas)
     draw.text((20, 12), "ISAAC VISUAL-SERVO POLICY DEBUG", font=_font(26, bold=True), fill=(245, 247, 250))
     draw.text(
         (570, 17),
-        f"{condition.upper()}  part={part_id}  target={target_id}  orientation={orientation_id}",
+        (
+            f"{condition.upper()}  profile={sim2real_profile}  part={part_id}  "
+            f"target={target_id}  orientation={orientation_id}"
+        ),
         font=_font(18),
         fill=(183, 193, 208),
     )
@@ -209,8 +293,18 @@ def _compose_frame(
     draw.rectangle((1068, 55, 1580, 343), outline=(83, 92, 106), width=2)
     draw.rectangle((1068, 362, 1580, 650), outline=(83, 92, 106), width=2)
     draw.text((38, 70), "EXTERNAL SIDE CAMERA", font=_font(18, bold=True), fill=(255, 255, 255))
-    draw.text((1085, 70), "LIVE WRIST RGB - POLICY INPUT", font=_font(17, bold=True), fill=(255, 255, 255))
-    draw.text((1085, 377), "GOAL RGB - POLICY INPUT", font=_font(17, bold=True), fill=(255, 255, 255))
+    draw.text(
+        (1085, 70),
+        "LIVE: ISAAC RTX - POLICY RGB 128x72",
+        font=_font(17, bold=True),
+        fill=(255, 255, 255),
+    )
+    draw.text(
+        (1085, 377),
+        "GOAL: MUJOCO FILAMENT - POLICY RGB 128x72",
+        font=_font(17, bold=True),
+        fill=(255, 255, 255),
+    )
 
     panel = (20, 620, 620, 880)
     draw.rounded_rectangle(panel, radius=10, fill=(21, 25, 31), outline=(65, 72, 84), width=2)
@@ -218,7 +312,8 @@ def _compose_frame(
         (f"time {sample.time_s:5.2f} s    result: {termination}", (239, 241, 245)),
         (f"reset progress {progress:.2f}    joint noise +/-{noise_rad:.3f} rad", (181, 191, 205)),
         (
-            f"spawn offset {position_offset_mm:.2f} mm    rotation {rotation_command_deg:.2f} deg",
+            f"part XY {position_offset_mm:.2f} mm    part yaw {object_yaw_deg:+.2f} deg    "
+            f"gripper rot. {rotation_command_deg:.2f} deg",
             (181, 191, 205),
         ),
         (f"initial   {initial_position_mm:8.3f} mm   {initial_rotation_deg:7.3f} deg", (220, 224, 232)),
@@ -262,8 +357,32 @@ def main(env_cfg, agent_cfg: dict) -> None:
     env_cfg.fixed_target_id = ""
     env_cfg.random_target_sampling = True
     env_cfg.debug_camera_enabled = True
-    env_cfg.live_observation_randomization_enabled = False
-    env_cfg.scene_appearance_randomization_enabled = False
+    sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
+    context_spec = resolve_policy_context(args_cli.policy_context)
+    env_cfg.policy_context_mode = context_spec.name
+    env_cfg.observation_space = policy_observation_size(
+        context_spec.name,
+        image_value_count=VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8,
+    )
+    agent_cfg["params"]["network"]["policy_context_size"] = context_spec.size
+    diagnostic_overrides: dict[str, object] = {}
+    if args_cli.force_profile_effects:
+        if env_cfg.live_observation_randomization_enabled:
+            env_cfg.live_clean_episode_fraction = 0.0
+            diagnostic_overrides["live_clean_episode_fraction"] = 0.0
+        if env_cfg.scene_clutter_enabled:
+            env_cfg.scene_clutter_environment_fraction = 1.0
+            diagnostic_overrides["scene_clutter_environment_fraction"] = 1.0
+        if env_cfg.scene_busy_background_enabled:
+            env_cfg.scene_busy_background_environment_fraction = 1.0
+            diagnostic_overrides["scene_busy_background_environment_fraction"] = 1.0
+    print(
+        f"[INFO] Debug-video sim-to-real profile: {sim2real_profile.identifier} "
+        f"({sim2real_profile.description})",
+        flush=True,
+    )
+    if diagnostic_overrides:
+        print(f"[INFO] Forced debug-video profile effects: {diagnostic_overrides}", flush=True)
     env_cfg.divergence_position_m = 10.0
     env_cfg.episode_length_s = args_cli.episode_seconds + 2.0
     env_cfg.reset_rotation_fraction_min = 1.0
@@ -313,6 +432,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
         noise_rad = float(condition_cfg["noise_rad"])
         rotation_fraction = float(condition_cfg["rotation_fraction"])
         position_fraction = float(condition_cfg["position_fraction"])
+        object_yaw_fraction = float(condition_cfg["object_yaw_fraction"])
         task_env.cfg.reset_progress_min = progress
         task_env.cfg.reset_progress_max = progress
         task_env.cfg.reset_joint_noise_far_rad = noise_rad
@@ -321,6 +441,8 @@ def main(env_cfg, agent_cfg: dict) -> None:
         task_env.cfg.reset_rotation_fraction_max = rotation_fraction
         task_env.cfg.reset_position_fraction_min = position_fraction
         task_env.cfg.reset_position_fraction_max = position_fraction
+        task_env.cfg.reset_object_yaw_fraction_min = object_yaw_fraction
+        task_env.cfg.reset_object_yaw_fraction_max = object_yaw_fraction
         task_env.fixed_target_index = (
             int(args_cli.target_indices[episode_index]) if args_cli.target_indices is not None else -1
         )
@@ -346,6 +468,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
         orientation_id = task_env.orientation_names[orientation_index]
         rotation_command_deg = float(torch.rad2deg(task_env.reset_rotation_command[0]).item())
         position_offset_mm = float(torch.linalg.norm(task_env.reset_position_offset[0]).item() * 1000.0)
+        object_yaw_deg = float(torch.rad2deg(task_env.reset_object_yaw_offset[0]).item())
         initial_position_mm = float(task_env.initial_position_error[0].item() * 1000.0)
         initial_rotation_deg = float(torch.rad2deg(task_env.initial_rotation_error[0]).item())
 
@@ -407,6 +530,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
                         noise_rad=noise_rad,
                         rotation_command_deg=rotation_command_deg,
                         position_offset_mm=position_offset_mm,
+                        object_yaw_deg=object_yaw_deg,
                         initial_position_mm=initial_position_mm,
                         initial_rotation_deg=initial_rotation_deg,
                         final_position_mm=final_position_mm,
@@ -414,6 +538,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
                         best_position_mm=best_position_mm,
                         best_rotation_deg=best_rotation_deg,
                         termination=termination,
+                        sim2real_profile=sim2real_profile.name,
                     )
                 )
             for _ in range(int(round(args_cli.fps))):
@@ -430,6 +555,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
                         noise_rad=noise_rad,
                         rotation_command_deg=rotation_command_deg,
                         position_offset_mm=position_offset_mm,
+                        object_yaw_deg=object_yaw_deg,
                         initial_position_mm=initial_position_mm,
                         initial_rotation_deg=initial_rotation_deg,
                         final_position_mm=final_position_mm,
@@ -437,6 +563,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
                         best_position_mm=best_position_mm,
                         best_rotation_deg=best_rotation_deg,
                         termination=termination,
+                        sim2real_profile=sim2real_profile.name,
                     )
                 )
         summary = {
@@ -450,6 +577,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
             "reset_noise_rad": noise_rad,
             "reset_rotation_command_deg": rotation_command_deg,
             "reset_position_offset_mm": position_offset_mm,
+            "reset_object_yaw_deg": object_yaw_deg,
             "initial_position_error_mm": initial_position_mm,
             "initial_rotation_error_deg": initial_rotation_deg,
             "final_position_error_mm": final_position_mm,
@@ -464,13 +592,22 @@ def main(env_cfg, agent_cfg: dict) -> None:
         summaries.append(summary)
         print(
             f"[VIDEO] {condition} part={part_id} target={target_id} {termination} "
-            f"spawn_offset={position_offset_mm:.2f} mm "
+            f"part_pose={position_offset_mm:.2f} mm/{object_yaw_deg:+.2f} deg "
             f"initial={initial_position_mm:.2f} mm/{initial_rotation_deg:.2f} deg "
             f"final={final_position_mm:.2f} mm/{final_rotation_deg:.2f} deg -> {video_path}",
             flush=True,
         )
 
-    payload = {"checkpoint": str(checkpoint), "seed": args_cli.seed, "episodes": summaries}
+    payload = {
+        "checkpoint": str(checkpoint),
+        "seed": args_cli.seed,
+        "sim2real_profile": sim2real_profile.name,
+        "sim2real_profile_id": sim2real_profile.identifier,
+        "sim2real_profile_description": sim2real_profile.description,
+        "sim2real_profile_overrides": dict(sim2real_profile.overrides),
+        "diagnostic_profile_overrides": diagnostic_overrides,
+        "episodes": summaries,
+    }
     (output_dir / "debug_video_metrics.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     env.close()
 

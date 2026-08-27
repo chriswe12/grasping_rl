@@ -5,18 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+from grasp_planning.rl.goal_catalog_profiles import MUJOCO_GOAL_RENDERER_PROFILE
 from grasp_planning.start_poses import (
-    KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
-    KUKA_Y_GRIPPER_APPROACH_CLEARANCE_TOTAL_M,
-    KUKA_Y_GRIPPER_APPROACH_PROFILE,
-    KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M,
+    PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
+    PDZ_GRIPPER_APPROACH_CLEARANCE_TOTAL_M,
+    PDZ_GRIPPER_APPROACH_PROFILE,
+    PDZ_GRIPPER_OPEN_WIDTH_M,
+    VISUAL_SERVO_GRIPPER_PROFILE,
 )
 
-CATALOG_SCHEMA_VERSION = 3
-SUPPORTED_CATALOG_SCHEMA_VERSIONS = (1, 2, CATALOG_SCHEMA_VERSION)
-ROTATION_RESET_SCHEMA_VERSION = 3
+CATALOG_SCHEMA_VERSION = 4
+SUPPORTED_CATALOG_SCHEMA_VERSIONS = (1, 2, 3, CATALOG_SCHEMA_VERSION)
+ROTATION_RESET_SCHEMA_VERSION = 4
 ROTATION_AXIS_SELECTION_METHOD = "fibonacci_farthest_point_v1"
-ROTATION_COLLISION_VALIDATION_PROFILE = "kuka_y_gripper_object_ground_clearance_v1"
+ROTATION_COLLISION_VALIDATION_PROFILE = "pdz_gripper_object_ground_clearance_v1"
+GOAL_RENDERER_PROFILE = MUJOCO_GOAL_RENDERER_PROFILE
 
 
 def _require_shape(
@@ -143,16 +146,16 @@ def load_multigrasp_catalog(  # noqa: C901 - strict schema validation is intenti
         approach_profile = str(
             np.asarray(arrays.get("approach_gripper_profile", "")).item()
         )
-        if approach_profile != KUKA_Y_GRIPPER_APPROACH_PROFILE:
+        if approach_profile != PDZ_GRIPPER_APPROACH_PROFILE:
             raise ValueError(
                 "Unsupported or missing approach-gripper profile "
                 f"'{approach_profile or 'unlabeled'}'; expected "
-                f"'{KUKA_Y_GRIPPER_APPROACH_PROFILE}'. Rebuild paths and goal images."
+                f"'{PDZ_GRIPPER_APPROACH_PROFILE}'. Rebuild paths and goal images."
             )
         clearance = float(
             np.asarray(arrays.get("approach_clearance_per_finger_m", np.nan)).item()
         )
-        if abs(clearance - KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M) > 1.0e-7:
+        if abs(clearance - PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M) > 1.0e-7:
             raise ValueError(
                 "Catalog approach clearance must be exactly 5 mm per finger."
             )
@@ -166,16 +169,31 @@ def load_multigrasp_catalog(  # noqa: C901 - strict schema validation is intenti
             raise ValueError(
                 "approach_gripper_widths_m must contain finite non-negative values."
             )
-        if np.any(approach_widths > KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M + 1.0e-7):
+        if np.any(approach_widths > PDZ_GRIPPER_OPEN_WIDTH_M + 1.0e-7):
             raise ValueError("A catalog approach aperture exceeds the physical gripper opening.")
         if not np.allclose(
             approach_widths - jaw_widths,
-            KUKA_Y_GRIPPER_APPROACH_CLEARANCE_TOTAL_M,
+            PDZ_GRIPPER_APPROACH_CLEARANCE_TOTAL_M,
             atol=1.0e-7,
             rtol=0.0,
         ):
             raise ValueError(
                 "Every approach aperture must equal its final jaw width plus 10 mm."
+            )
+    if schema_version >= 4:
+        robot_profile = str(np.asarray(arrays.get("robot_profile", "")).item())
+        if robot_profile != VISUAL_SERVO_GRIPPER_PROFILE:
+            raise ValueError(
+                f"Goal catalog robot profile '{robot_profile or 'unlabeled'}' does not "
+                f"match '{VISUAL_SERVO_GRIPPER_PROFILE}'."
+            )
+        renderer_profile = str(
+            np.asarray(arrays.get("goal_renderer_profile", "")).item()
+        )
+        if renderer_profile != GOAL_RENDERER_PROFILE:
+            raise ValueError(
+                f"Goal renderer profile '{renderer_profile or 'unlabeled'}' does not "
+                f"match '{GOAL_RENDERER_PROFILE}'."
             )
 
     for name in ("moveit_plan_validated", "isaac_goal_rgbd_captured"):
@@ -394,6 +412,21 @@ def load_multigrasp_rotation_resets(
             "Unsupported or missing reset-collision validation profile "
             f"'{collision_profile or 'unlabeled'}'; expected "
             f"'{ROTATION_COLLISION_VALIDATION_PROFILE}'. Rebuild rotation resets."
+        )
+    robot_profile = str(np.asarray(arrays.get("robot_profile", "")).item())
+    if robot_profile != VISUAL_SERVO_GRIPPER_PROFILE:
+        raise ValueError(
+            f"Rotation-reset robot profile '{robot_profile or 'unlabeled'}' does not "
+            f"match '{VISUAL_SERVO_GRIPPER_PROFILE}'."
+        )
+    approach_profile = str(
+        np.asarray(arrays.get("approach_gripper_profile", "")).item()
+    )
+    if approach_profile != PDZ_GRIPPER_APPROACH_PROFILE:
+        raise ValueError(
+            "Rotation-reset approach-gripper profile "
+            f"'{approach_profile or 'unlabeled'}' does not match "
+            f"'{PDZ_GRIPPER_APPROACH_PROFILE}'."
         )
     collision_clearance = float(
         np.asarray(arrays.get("minimum_collision_clearance_m", np.nan)).item()

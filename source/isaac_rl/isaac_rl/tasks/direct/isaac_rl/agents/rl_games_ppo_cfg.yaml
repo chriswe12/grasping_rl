@@ -45,8 +45,9 @@ params:
     num_actors: -1
     reward_shaper: {scale_value: 1.0}
     normalize_advantage: true
-    gamma: 0.99
-    tau: 0.95
+    # Time-equivalent to gamma=0.99, tau=0.95 at the former 30 Hz rate.
+    gamma: 0.9801
+    tau: 0.9025
     learning_rate: 5.0e-5
     lr_schedule: linear
     kl_threshold: 0.012

@@ -38,14 +38,15 @@ def parse_args() -> argparse.Namespace:
             "plan",
             "paths",
             "rotation",
+            "mujoco",
             "isaac",
             "finalize",
             "cpu",
         ),
         default="cpu",
         help=(
-            "Run one stage, all CPU stages, the deferred Isaac USD/goal capture "
-            "stage, or finalize the passing subset from a failed Isaac capture. "
+            "Run one stage, all CPU stages, the deferred MuJoCo goal-render "
+            "stage, or finalize the passing subset from a failed capture. "
             "Every stage is resumable."
         ),
     )
@@ -256,6 +257,15 @@ def _generate_sources(*, force: bool) -> None:
         payload["geometry"]["target_mesh_path"] = (
             f"obj/fabrica/plumbers_block/{part_id}.obj"
         )
+        payload["planning"].update(
+            {
+                "num_surface_samples": 1024,
+                "min_jaw_width": 0.012,
+                "max_jaw_width": 0.062,
+                "detailed_finger_contact_gap_m": 0.005,
+                "gripper_collision_model": "pdz_gripper",
+            }
+        )
         debug_dir = DATA_ROOT / "sources/debug"
         payload["artifacts"] = {
             "stage1_json": str(stage1),
@@ -266,6 +276,14 @@ def _generate_sources(*, force: bool) -> None:
         }
         payload["mujoco_execution"]["enabled"] = False
         payload["isaac_execution"]["enabled"] = False
+        payload["isaac_execution"].update(
+            {
+                "fr3_usd": "assets/usd/kuka_iiwa7_pdz_gripper/kuka_iiwa7_pdz_gripper.usd",
+                "moveit_pose_link": "pdz_gripper_tcp",
+                "gripper_width_clearance": 0.01,
+                "contact_gap_m": 0.005,
+            }
+        )
         payload["ros2"]["part_id"] = int(part_id)
         stage1.parent.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -404,19 +422,7 @@ def _render_debug_artifacts() -> None:
     )
 
 
-def _run_isaac_stage(isaaclab: Path) -> None:
-    if not isaaclab.is_file():
-        raise FileNotFoundError(isaaclab)
-    _run(
-        [
-            str(isaaclab.resolve()),
-            "-p",
-            "isaac_rl/scripts/build_assembly_part_usds.py",
-            "--manifest",
-            str(DATA_ROOT / "planned_manifest.json"),
-            "--headless",
-        ]
-    )
+def _run_mujoco_stage() -> None:
     goal_catalog = DATA_ROOT / "goal_catalog.npz"
     paths_asset = DATA_ROOT / "paths.npz"
     rotation_reset_asset = DATA_ROOT / "rotation_resets.npz"
@@ -448,7 +454,7 @@ def _run_isaac_stage(isaaclab: Path) -> None:
                 raise
             capture_paths_asset = temporary_capture_paths
             print(
-                f"[FILTER] Isaac goal capture will use {selected_count}/"
+                f"[FILTER] MuJoCo goal rendering will use {selected_count}/"
                 f"{len(path_target_ids)} path targets matching the validated "
                 "rotation-reset asset.",
                 flush=True,
@@ -461,16 +467,17 @@ def _run_isaac_stage(isaaclab: Path) -> None:
         try:
             _run(
                 [
-                    str(isaaclab.resolve()),
-                    "-p",
-                    "isaac_rl/scripts/capture_multigrasp_goal_catalog.py",
+                    str((REPO_ROOT / "scripts/run_mujoco_filament.sh").resolve()),
+                    sys.executable,
+                    "isaac_rl/scripts/capture_multigrasp_goal_catalog_mujoco.py",
                     "--paths-asset",
                     str(capture_paths_asset),
+                    "--manifest",
+                    str(DATA_ROOT / "planned_manifest.json"),
                     "--output",
                     str(goal_catalog),
-                    "--exclusions-file",
-                    str(DATA_ROOT / "goal_exclusions.json"),
-                    "--headless",
+                    "--contact-sheet",
+                    str(DEBUG_ROOT / "goal_rgb_contact_sheet.png"),
                 ]
             )
         except subprocess.CalledProcessError as error:
@@ -493,7 +500,7 @@ def _run_isaac_stage(isaaclab: Path) -> None:
         if temporary_capture_paths is not None:
             temporary_capture_paths.unlink(missing_ok=True)
     print(
-        f"[VALIDATE] Fresh Isaac goal catalog contains {target_count} complete "
+        f"[VALIDATE] Fresh MuJoCo goal catalog contains {target_count} complete "
         "targets under the active visual profiles.",
         flush=True,
     )
@@ -531,8 +538,14 @@ def main() -> None:
             _build_paths()
         elif stage == "rotation":
             _build_rotation_resets()
-        elif stage == "isaac":
-            _run_isaac_stage(args.isaaclab.expanduser())
+        elif stage in {"mujoco", "isaac"}:
+            if stage == "isaac":
+                print(
+                    "[DEPRECATED] --stage isaac now aliases the MuJoCo Filament "
+                    "goal renderer; use --stage mujoco.",
+                    flush=True,
+                )
+            _run_mujoco_stage()
         elif stage == "finalize":
             _finalize_failed_isaac_capture(DATA_ROOT)
             _render_debug_artifacts()
@@ -541,7 +554,7 @@ def main() -> None:
     if args.stage == "cpu":
         print(
             "\n[DONE] All CPU stages completed. When the GPU is free, run:\n"
-            "python3 isaac_rl/scripts/prepare_plumbers_block_catalog.py --stage isaac",
+            "python3 isaac_rl/scripts/prepare_plumbers_block_catalog.py --stage mujoco",
             flush=True,
         )
 

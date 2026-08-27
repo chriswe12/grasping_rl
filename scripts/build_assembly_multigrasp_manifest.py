@@ -20,6 +20,7 @@ for import_path in (REPO_ROOT, SCRIPT_ROOT):
 from build_multigrasp_manifest import build_manifest  # noqa: E402
 
 SCHEMA_VERSION = 4
+GLOBAL_ID_SCHEMA_VERSION = 5
 SPLIT_NAMES = ("train", "validation", "test")
 
 
@@ -41,22 +42,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alternates-per-part-orientation", type=int, default=256)
     parser.add_argument("--pregrasp-offset", type=float, default=0.10)
     parser.add_argument("--gripper-width-clearance", type=float, default=0.01)
-    # 74 mm is the largest final jaw width that still permits the required
-    # 5 mm-per-finger approach clearance inside the 84 mm physical opening.
-    parser.add_argument("--max-training-jaw-width", type=float, default=0.074)
+    # 66 mm is the largest final jaw width that still permits the required
+    # 5 mm-per-finger approach clearance inside the PDZ 76 mm opening.
+    parser.add_argument("--max-training-jaw-width", type=float, default=0.066)
     parser.add_argument("--minimum-pregrasp-height", type=float, default=0.05)
+    parser.add_argument(
+        "--object-xy-world",
+        type=float,
+        nargs=2,
+        default=(0.4252643585205078, 0.05988234281539917),
+        metavar=("X", "Y"),
+    )
     parser.add_argument("--train-fraction", type=float, default=0.80)
     parser.add_argument("--validation-fraction", type=float, default=0.10)
     parser.add_argument("--split-seed", type=int, default=20260804)
+    parser.add_argument(
+        "--global-ids",
+        action="store_true",
+        help=(
+            "Namespace part, orientation, and target identifiers with the assembly "
+            "name. Required when manifests from multiple assemblies will be merged."
+        ),
+    )
+    parser.add_argument(
+        "--part-usd-dir",
+        type=Path,
+        default=None,
+        help="Override the directory containing part_<id>_bundle_local.usd assets.",
+    )
+    parser.add_argument(
+        "--allow-excluded-parts",
+        action="store_true",
+        help=(
+            "Record parts that cannot produce a valid manifest instead of aborting "
+            "the entire assembly build."
+        ),
+    )
     return parser.parse_args()
 
 
-def _prefixed_orientation(part_id: str, orientation_id: str) -> str:
-    return f"part_{part_id}__{orientation_id}"
+def _part_key(assembly_name: str, part_id: str) -> str:
+    return f"{assembly_name}__part_{part_id}"
 
 
-def _prefixed_target(part_id: str, orientation_id: str, grasp_id: str) -> str:
-    return f"part_{part_id}__{orientation_id}__{grasp_id}"
+def _prefixed_orientation(
+    part_id: str,
+    orientation_id: str,
+    *,
+    assembly_name: str | None = None,
+) -> str:
+    prefix = f"part_{part_id}" if assembly_name is None else _part_key(assembly_name, part_id)
+    return f"{prefix}__{orientation_id}"
+
+
+def _prefixed_target(
+    part_id: str,
+    orientation_id: str,
+    grasp_id: str,
+    *,
+    assembly_name: str | None = None,
+) -> str:
+    return (
+        f"{_prefixed_orientation(part_id, orientation_id, assembly_name=assembly_name)}"
+        f"__{grasp_id}"
+    )
 
 
 def _annotate_part_manifest(
@@ -66,23 +115,40 @@ def _annotate_part_manifest(
     part_id: str,
     part_index: int,
     part_usd_path: Path,
+    global_ids: bool = False,
 ) -> dict[str, object]:
     payload = json.loads(json.dumps(manifest))
+    namespace = assembly_name if global_ids else None
+    part_key = _part_key(assembly_name, part_id)
+    manifest_part_id = part_key if global_ids else part_id
     for orientation in payload["orientations"]:
         local_id = str(orientation["orientation_id"])
         orientation["local_orientation_id"] = local_id
-        orientation["orientation_id"] = _prefixed_orientation(part_id, local_id)
+        orientation["orientation_id"] = _prefixed_orientation(
+            part_id, local_id, assembly_name=namespace
+        )
         orientation["assembly_name"] = assembly_name
-        orientation["part_id"] = part_id
+        orientation["part_key"] = part_key
+        orientation["local_part_id"] = part_id
+        orientation["part_id"] = manifest_part_id
         orientation["part_index"] = part_index
     for target in payload["targets"] + payload.get("alternates", []):
         local_orientation = str(target["orientation_id"])
         grasp_id = str(target["grasp_id"])
         target["local_orientation_id"] = local_orientation
-        target["orientation_id"] = _prefixed_orientation(part_id, local_orientation)
-        target["target_id"] = _prefixed_target(part_id, local_orientation, grasp_id)
+        target["orientation_id"] = _prefixed_orientation(
+            part_id, local_orientation, assembly_name=namespace
+        )
+        target["target_id"] = _prefixed_target(
+            part_id,
+            local_orientation,
+            grasp_id,
+            assembly_name=namespace,
+        )
         target["assembly_name"] = assembly_name
-        target["part_id"] = part_id
+        target["part_key"] = part_key
+        target["local_part_id"] = part_id
+        target["part_id"] = manifest_part_id
         target["part_index"] = part_index
         target["part_usd_path"] = str(part_usd_path.resolve())
     return payload
@@ -171,18 +237,33 @@ def build_assembly_manifest(args: argparse.Namespace) -> dict[str, object]:
     orientations: list[dict[str, object]] = []
     targets: list[dict[str, object]] = []
     alternates: list[dict[str, object]] = []
+    exclusions: list[dict[str, object]] = []
     for part_index, raw_part_id in enumerate(args.part_ids):
         part_id = str(raw_part_id)
         stage1 = args.source_dir / f"part_{part_id}_stage1.json"
         stage2 = args.source_dir / f"part_{part_id}_stage2.json"
-        for required in (stage1, stage2):
-            if not required.is_file():
-                raise FileNotFoundError(
-                    f"Missing CPU planning source {required}. Generate it with "
-                    "prepare_plumbers_block_catalog.py --stage sources."
+        missing = [required for required in (stage1, stage2) if not required.is_file()]
+        if missing:
+            if bool(getattr(args, "allow_excluded_parts", False)):
+                exclusions.append(
+                    {
+                        "assembly_name": str(args.assembly_name),
+                        "local_part_id": part_id,
+                        "part_key": _part_key(str(args.assembly_name), part_id),
+                        "reason": "missing_planning_source",
+                        "detail": ", ".join(str(path) for path in missing),
+                    }
                 )
+                continue
+            raise FileNotFoundError(
+                f"Missing CPU planning source {missing[0]}. Generate it with "
+                "prepare_plumbers_block_catalog.py --stage sources."
+            )
+        part_usd_dir = getattr(args, "part_usd_dir", None)
         part_usd_path = (
-            REPO_ROOT
+            Path(part_usd_dir) / f"part_{part_id}_bundle_local.usd"
+            if part_usd_dir is not None
+            else REPO_ROOT
             / "isaac_rl/data"
             / args.assembly_name
             / "usd"
@@ -197,14 +278,31 @@ def build_assembly_manifest(args: argparse.Namespace) -> dict[str, object]:
             gripper_width_clearance=float(args.gripper_width_clearance),
             max_training_jaw_width=float(args.max_training_jaw_width),
             minimum_pregrasp_height=float(args.minimum_pregrasp_height),
+            object_xy_world=tuple(float(value) for value in args.object_xy_world),
             alternates_per_orientation=int(args.alternates_per_part_orientation),
         )
+        try:
+            raw_part_manifest = build_manifest(part_args)
+        except Exception as error:
+            if not bool(getattr(args, "allow_excluded_parts", False)):
+                raise
+            exclusions.append(
+                {
+                    "assembly_name": str(args.assembly_name),
+                    "local_part_id": part_id,
+                    "part_key": _part_key(str(args.assembly_name), part_id),
+                    "reason": "no_valid_training_targets",
+                    "detail": str(error),
+                }
+            )
+            continue
         part_manifest = _annotate_part_manifest(
-            build_manifest(part_args),
+            raw_part_manifest,
             assembly_name=args.assembly_name,
             part_id=part_id,
             part_index=part_index,
             part_usd_path=part_usd_path,
+            global_ids=bool(getattr(args, "global_ids", False)),
         )
         # A stable resting orientation can legitimately have no grasp that
         # passes the gripper/ground filters. It is not a learnable stratum and
@@ -216,7 +314,14 @@ def build_assembly_manifest(args: argparse.Namespace) -> dict[str, object]:
         ]
         parts.append(
             {
-                "part_id": part_id,
+                "part_id": (
+                    _part_key(str(args.assembly_name), part_id)
+                    if bool(getattr(args, "global_ids", False))
+                    else part_id
+                ),
+                "part_key": _part_key(str(args.assembly_name), part_id),
+                "local_part_id": part_id,
+                "assembly_name": str(args.assembly_name),
                 "part_index": part_index,
                 "target_mesh_path": str(part_manifest["target_mesh_path"]),
                 "mesh_scale": float(part_manifest["mesh_scale"]),
@@ -232,13 +337,19 @@ def build_assembly_manifest(args: argparse.Namespace) -> dict[str, object]:
         targets.extend(part_manifest["targets"])
         alternates.extend(part_manifest["alternates"])
 
-    assignment, split_salt = _group_split_assignment(
-        targets + alternates,
-        coverage_targets=targets,
-        train_fraction=float(args.train_fraction),
-        validation_fraction=float(args.validation_fraction),
-        seed=int(args.split_seed),
-    )
+    if not targets:
+        if not bool(getattr(args, "allow_excluded_parts", False)):
+            raise ValueError("The assembly produced no selectable training targets.")
+        assignment: dict[tuple[str, str], str] = {}
+        split_salt = 0
+    else:
+        assignment, split_salt = _group_split_assignment(
+            targets + alternates,
+            coverage_targets=targets,
+            train_fraction=float(args.train_fraction),
+            validation_fraction=float(args.validation_fraction),
+            seed=int(args.split_seed),
+        )
     for target in targets:
         target["split"] = assignment[(str(target["part_id"]), str(target["grasp_id"]))]
     for target in alternates:
@@ -269,10 +380,16 @@ def build_assembly_manifest(args: argparse.Namespace) -> dict[str, object]:
         orientation_split_counts[orientation_id] = counts
 
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": (
+            GLOBAL_ID_SCHEMA_VERSION
+            if bool(getattr(args, "global_ids", False))
+            else SCHEMA_VERSION
+        ),
         "assembly_name": str(args.assembly_name),
         "part_count": len(parts),
+        "configured_part_count": len(args.part_ids),
         "parts": parts,
+        "exclusions": exclusions,
         "selection": {
             "selected_target_count": len(targets),
             "alternate_target_count": len(alternates),

@@ -23,13 +23,13 @@ for import_path in (REPO_ROOT, SCRIPT_ROOT):
 
 from build_reset_trajectory_asset import (  # noqa: E402
     MOVEIT_TO_ISAAC_SIGNS,
-    _fixed_joint_translation,
+    _robot_tcp_transform_link7,
 )
 from grasp_planning.grasping.collision import (  # noqa: E402
     BoxCollisionPrimitive,
     GraspCollisionEvaluator,
-    KukaYGripperCollisionModel,
     MeshCollisionPrimitive,
+    PdzGripperCollisionModel,
 )
 from grasp_planning.grasping.fabrica_grasp_debug import load_grasp_bundle  # noqa: E402
 from grasp_planning.grasping.finger_geometry import finger_box_corners  # noqa: E402
@@ -37,13 +37,14 @@ from grasp_planning.grasping.mesh_antipodal_grasp_generator import TriangleMesh 
 from grasp_planning.grasping.world_constraints import ObjectWorldPose  # noqa: E402
 from grasp_planning.mujoco import build_bundle_local_mesh  # noqa: E402
 from grasp_planning.start_poses import (  # noqa: E402
-    KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
-    KUKA_Y_GRIPPER_APPROACH_PROFILE,
+    PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
+    PDZ_GRIPPER_APPROACH_PROFILE,
+    VISUAL_SERVO_GRIPPER_PROFILE,
 )
 
-ROTATION_RESET_SCHEMA_VERSION = 3
+ROTATION_RESET_SCHEMA_VERSION = 4
 AXIS_SELECTION_METHOD = "fibonacci_farthest_point_v1"
-COLLISION_VALIDATION_PROFILE = "kuka_y_gripper_object_ground_clearance_v1"
+COLLISION_VALIDATION_PROFILE = "pdz_gripper_object_ground_clearance_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         "--robot-urdf",
         type=Path,
         default=REPO_ROOT
-        / "assets/urdf/kuka_iiwa7_y_gripper/urdf/kuka_iiwa7_y_gripper.urdf",
+        / "assets/urdf/kuka_iiwa7_pdz_gripper/urdf/kuka_iiwa7_pdz_gripper.urdf",
     )
     parser.add_argument("--variants", type=int, default=16)
     parser.add_argument("--far-rotation-deg", type=float, default=15.0)
@@ -113,7 +114,7 @@ def _primitive_vertices(
 def _minimum_gripper_clearance(
     *,
     object_scene,
-    collision_model: KukaYGripperCollisionModel,
+    collision_model: PdzGripperCollisionModel,
     tcp_position_w: np.ndarray,
     tcp_rotation_w: np.ndarray,
     jaw_width_m: float,
@@ -267,19 +268,19 @@ def main() -> None:  # noqa: C901 - asset validation is one deliberate linear pi
         len(target_ids),
     ):
         raise ValueError("Path asset must contain one jaw and approach width per target.")
-    if approach_profile != KUKA_Y_GRIPPER_APPROACH_PROFILE:
+    if approach_profile != PDZ_GRIPPER_APPROACH_PROFILE:
         raise ValueError(
             f"Path asset approach profile is '{approach_profile or 'unlabeled'}'; "
-            f"expected '{KUKA_Y_GRIPPER_APPROACH_PROFILE}'."
+            f"expected '{PDZ_GRIPPER_APPROACH_PROFILE}'."
         )
     if abs(
         approach_clearance_per_finger
-        - KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M
+        - PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M
     ) > 1.0e-7:
         raise ValueError("Path asset must encode exactly 5 mm clearance per finger.")
     if not np.allclose(
         approach_widths - jaw_widths,
-        2.0 * KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
+        2.0 * PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
         atol=1.0e-7,
         rtol=0.0,
     ):
@@ -310,8 +311,8 @@ def main() -> None:  # noqa: C901 - asset validation is one deliberate linear pi
         bundle = load_grasp_bundle(bundle_path)
         part_meshes.append(build_bundle_local_mesh(bundle))
 
-    collision_model = KukaYGripperCollisionModel(
-        contact_gap_m=KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M
+    collision_model = PdzGripperCollisionModel(
+        contact_gap_m=PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M
     )
     collision_evaluator = GraspCollisionEvaluator(collision_model)
     collision_scene_cache: dict[tuple[object, ...], object] = {}
@@ -348,9 +349,9 @@ def main() -> None:  # noqa: C901 - asset validation is one deliberate linear pi
     if link7_id < 0:
         raise ValueError("Robot URDF did not produce a link7 MuJoCo body.")
     urdf_root = ElementTree.parse(robot_urdf).getroot()
-    tcp_offset_link7 = _fixed_joint_translation(
-        urdf_root, "gripper_mount_joint"
-    ) + _fixed_joint_translation(urdf_root, "gripper_tcp_joint")
+    tcp_offset_link7, tcp_rotation_link7, _tcp_link = _robot_tcp_transform_link7(
+        urdf_root
+    )
     joint_lower = model.jnt_range[:7, 0]
     joint_upper = model.jnt_range[:7, 1]
     # Assembly-scale catalogs include targets close to different joint limits.
@@ -367,8 +368,9 @@ def main() -> None:  # noqa: C901 - asset validation is one deliberate linear pi
     def pose_and_jacobian(q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data.qpos[:7] = q
         mujoco.mj_forward(model, data)
-        rotation = data.xmat[link7_id].reshape(3, 3).copy()
-        position = data.xpos[link7_id].copy() + rotation @ tcp_offset_link7
+        link7_rotation = data.xmat[link7_id].reshape(3, 3).copy()
+        position = data.xpos[link7_id].copy() + link7_rotation @ tcp_offset_link7
+        rotation = link7_rotation @ tcp_rotation_link7
         jacobian_position = np.zeros((3, model.nv), dtype=np.float64)
         jacobian_rotation = np.zeros((3, model.nv), dtype=np.float64)
         mujoco.mj_jac(
@@ -875,7 +877,8 @@ def main() -> None:  # noqa: C901 - asset validation is one deliberate linear pi
             nominal_collision_clearances.shape, dtype=np.bool_
         ),
         "nominal_collision_clearance_m": nominal_collision_clearances,
-        "approach_gripper_profile": np.asarray(KUKA_Y_GRIPPER_APPROACH_PROFILE),
+        "robot_profile": np.asarray(VISUAL_SERVO_GRIPPER_PROFILE),
+        "approach_gripper_profile": np.asarray(PDZ_GRIPPER_APPROACH_PROFILE),
         "approach_gripper_widths_m": approach_widths.astype(np.float32),
         "far_rotation_rad": np.asarray(np.deg2rad(args.far_rotation_deg), dtype=np.float32),
         "near_rotation_rad": np.asarray(np.deg2rad(args.near_rotation_deg), dtype=np.float32),

@@ -39,6 +39,12 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to model 
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--experiment-name",
+    type=str,
+    default=None,
+    help="Stable, human-readable run-directory name for controlled ablations.",
+)
+parser.add_argument(
     "--global_minibatch_size",
     type=int,
     default=None,
@@ -57,11 +63,21 @@ parser.add_argument(
         "appearance",
         "combined_sim2real",
         "combined_clutter",
+        "combined_busy_background",
         "combined_depth_robust",
         "stress_test",
     ),
     default="combined_sim2real",
     help="Named randomization profile recorded with this training run.",
+)
+parser.add_argument(
+    "--policy-context",
+    choices=("action", "action_twist", "action_twist_rotation"),
+    default="action",
+    help=(
+        "Deployment-measurable actor context: previous action only; add normalized camera-frame TCP twist; "
+        "or additionally add the continuous 6D base-from-camera orientation."
+    ),
 )
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
@@ -130,8 +146,12 @@ import isaac_rl.tasks  # noqa: F401
 from grasp_planning.d405_wrist_camera import (
     D405_VISUAL_SERVO_CAMERA_PROFILE,
     D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+    VISUAL_SERVO_OBSERVATION_HEIGHT,
+    VISUAL_SERVO_OBSERVATION_WIDTH,
 )
 from grasp_planning.rl.distributed_observer import DistributedSafeIsaacAlgoObserver
+from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context
+from grasp_planning.rl.policy_timing import PHYSICS_RATE_HZ, POLICY_RATE_HZ
 from grasp_planning.rl.ppo_batching import resolve_local_minibatch_size
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (
@@ -193,13 +213,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     local_rank = int(os.getenv("ISAAC_RL_ORIGINAL_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
+    context_spec = resolve_policy_context(args_cli.policy_context)
+    env_cfg.policy_context_mode = context_spec.name
+    env_cfg.observation_space = policy_observation_size(
+        context_spec.name,
+        image_value_count=VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8,
+    )
+    agent_cfg["params"]["network"]["policy_context_size"] = context_spec.size
     run_profile_metadata = {
         "profile": sim2real_profile.name,
         "profile_id": sim2real_profile.identifier,
         "description": sim2real_profile.description,
         "camera_profile": D405_VISUAL_SERVO_CAMERA_PROFILE,
         "observation_profile": D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+        "policy_rate_hz": POLICY_RATE_HZ,
+        "physics_rate_hz": PHYSICS_RATE_HZ,
         "overrides": dict(sim2real_profile.overrides),
+        "policy_context": {
+            "mode": context_spec.name,
+            "size": context_spec.size,
+            "uses_tcp_twist": context_spec.uses_tcp_twist,
+            "uses_camera_rotation": context_spec.uses_camera_rotation,
+            "network_input_size": env_cfg.observation_space,
+        },
         "distributed": {
             "enabled": bool(args_cli.distributed),
             "world_size": world_size,
@@ -215,6 +251,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     }
     EssentialSummaryWriter._run_metadata = run_profile_metadata
     print(f"[INFO] Sim-to-real profile: {sim2real_profile.identifier} ({sim2real_profile.description})")
+    print(
+        f"[INFO] Policy context: {context_spec.name} ({context_spec.size} values); "
+        f"full observation={env_cfg.observation_space}"
+    )
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     run_profile_metadata["distributed"]["environments_per_rank"] = env_cfg.scene.num_envs
@@ -265,7 +305,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
-    log_dir = agent_cfg["params"]["config"].get("full_experiment_name")
+    log_dir = args_cli.experiment_name or agent_cfg["params"]["config"].get("full_experiment_name")
     if not log_dir:
         log_dir = os.getenv("ISAAC_RL_EXPERIMENT_NAME") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # set directory into agent config

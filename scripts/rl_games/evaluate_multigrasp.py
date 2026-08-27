@@ -104,11 +104,18 @@ parser.add_argument(
         "appearance",
         "combined_sim2real",
         "combined_clutter",
+        "combined_busy_background",
         "combined_depth_robust",
         "stress_test",
     ),
     default="nominal",
     help="Reproducible sensor/camera/timing/appearance evaluation profile.",
+)
+parser.add_argument(
+    "--policy-context",
+    choices=("action", "action_twist", "action_twist_rotation"),
+    default="action",
+    help="Actor context contract used by the checkpoint.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -132,8 +139,11 @@ import torch  # noqa: E402
 from grasp_planning.d405_wrist_camera import (  # noqa: E402
     D405_VISUAL_SERVO_CAMERA_PROFILE,
     D405_VISUAL_SERVO_OBSERVATION_PROFILE,
+    VISUAL_SERVO_OBSERVATION_HEIGHT,
+    VISUAL_SERVO_OBSERVATION_WIDTH,
 )
 from grasp_planning.rl.completion_diagnostics import CompletionDiagnostics  # noqa: E402
+from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context  # noqa: E402
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile  # noqa: E402
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (  # noqa: E402
     register_grasp_completion_runner,
@@ -184,6 +194,10 @@ def _summarize(rows: list[dict[str, object]]) -> dict[str, object]:
         "reset_rotation_command_deg_mean": mean(float(row["reset_rotation_command_deg"]) for row in rows),
         "reset_position_offset_mm_mean": mean(float(row["reset_position_offset_mm"]) for row in rows),
         "reset_position_requested_mm_mean": mean(float(row["reset_position_requested_mm"]) for row in rows),
+        "reset_object_yaw_deg_mean": mean(abs(float(row["reset_object_yaw_deg"])) for row in rows),
+        "reset_object_yaw_requested_deg_mean": mean(
+            float(row["reset_object_yaw_requested_deg"]) for row in rows
+        ),
         "final_completion_probability_mean": mean(float(row["final_completion_probability"]) for row in rows),
     }
 
@@ -253,6 +267,11 @@ def _build_report(
             "Horizontal position offsets are measured from the nominal path waypoint "
             "and conservatively capped by each reset state's validated collision clearance."
         )
+    if any(float(row["reset_object_yaw_requested_deg"]) > 0.0 for row in rows):
+        note_parts.append(
+            "Object yaw moves the physical part and its part-relative target rigidly while the canonical "
+            "goal image remains fixed; surface displacement is collision-clearance capped."
+        )
     note = " ".join(note_parts)
     payload = {
         "checkpoint": str(checkpoint),
@@ -276,15 +295,16 @@ def _build_report(
         f"Each attempt had up to {episode_seconds:.1f} s.",
         "",
         (
-            "| Condition | Progress | Position offset | Rotation cmd. | Attempts | Success "
+            "| Condition | Progress | Position offset | Object yaw | Rotation cmd. | Attempts | Success "
             "| Initial pos. | Initial rot. | Final pos. | Final rot. |"
         ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for condition, metrics in conditions.items():
         lines.append(
             f"| {condition} | {metrics['reset_progress_mean']:.2f} "
             f"| {metrics['reset_position_offset_mm_mean']:.2f} mm "
+            f"| {metrics['reset_object_yaw_deg_mean']:.2f} deg "
             f"| {metrics['reset_rotation_command_deg_mean']:.2f} deg "
             f"| {metrics['attempts']} | {100.0 * metrics['success_rate']:.1f}% "
             f"| {metrics['initial_position_error_mm_mean']:.2f} mm "
@@ -366,6 +386,13 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
     if args_cli.episode_seconds <= 0.0:
         raise ValueError("--episode_seconds must be positive.")
     sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
+    context_spec = resolve_policy_context(args_cli.policy_context)
+    env_cfg.policy_context_mode = context_spec.name
+    env_cfg.observation_space = policy_observation_size(
+        context_spec.name,
+        image_value_count=VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8,
+    )
+    agent_cfg["params"]["network"]["policy_context_size"] = context_spec.size
     if any(
         value < 0.0
         for value in (
@@ -497,6 +524,8 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
             reset_rotation = torch.rad2deg(_cpu(task_env.reset_rotation_command))
             reset_position = torch.linalg.norm(_cpu(task_env.reset_position_offset), dim=-1) * 1000.0
             reset_position_requested = _cpu(task_env.reset_position_requested) * 1000.0
+            reset_object_yaw = torch.rad2deg(_cpu(task_env.reset_object_yaw_offset))
+            reset_object_yaw_requested = torch.rad2deg(_cpu(task_env.reset_object_yaw_requested))
             best_position = initial_position.clone()
             best_rotation = initial_rotation.clone()
             final_position = initial_position.clone()
@@ -506,12 +535,12 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
             terminal_steps = torch.full((task_env.num_envs,), max_steps, dtype=torch.long)
             active = torch.ones(task_env.num_envs, dtype=torch.bool)
 
-            # Open-loop baseline: remove the authored lateral reset offset from
-            # the initial goal vector, then execute only that nominal straight
-            # displacement. It never corrects translation or orientation from
-            # observations after reset.
+            # Open-loop baseline: remove the complete part-pose-induced target
+            # displacement from the initial goal vector, then execute only the
+            # nominal straight displacement. It never corrects translation or
+            # orientation from observations after reset.
             initial_tcp_position, initial_tcp_quaternion, initial_position_error_w, _ = task_env._tcp_error()
-            blind_displacement_w = initial_position_error_w + task_env.reset_position_offset
+            blind_displacement_w = initial_position_error_w + task_env.reset_goal_position_delta
             blind_distance_m = torch.linalg.norm(blind_displacement_w, dim=-1)
             blind_direction_w = blind_displacement_w / blind_distance_m.clamp_min(1.0e-9).unsqueeze(-1)
             rotation_w_camera = task_env._rotation_world_from_camera(initial_tcp_quaternion)
@@ -615,6 +644,10 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                         "reset_rotation_command_deg": float(reset_rotation[env_index]),
                         "reset_position_offset_mm": float(reset_position[env_index]),
                         "reset_position_requested_mm": float(reset_position_requested[env_index]),
+                        "reset_object_yaw_deg": float(reset_object_yaw[env_index]),
+                        "reset_object_yaw_requested_deg": float(
+                            reset_object_yaw_requested[env_index]
+                        ),
                         "initial_position_error_mm": float(initial_position[env_index]),
                         "initial_rotation_error_deg": float(initial_rotation[env_index]),
                         "final_position_error_mm": float(final_position[env_index]),
@@ -629,6 +662,7 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                 f"[EVAL] {condition} progress={progress_value:.2f} "
                 f"noise={noise_rad:.3f} rad "
                 f"position_offset={completed['reset_position_offset_mm_mean']:.2f} mm "
+                f"object_yaw={completed['reset_object_yaw_deg_mean']:.2f} deg "
                 f"repeat={repeat + 1}/{args_cli.runs_per_target} "
                 f"success={100.0 * completed['success_rate']:.1f}% "
                 f"final={completed['final_position_error_mm_mean']:.2f} mm / "

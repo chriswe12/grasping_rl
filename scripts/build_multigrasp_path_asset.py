@@ -28,10 +28,11 @@ from build_reset_trajectory_asset import (  # noqa: E402
     _straight_cartesian_joint_path,
 )
 from grasp_planning.start_poses import (  # noqa: E402
-    KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
-    KUKA_Y_GRIPPER_APPROACH_PROFILE,
-    KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M,
-    kuka_y_gripper_approach_width_from_jaw_width,
+    PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M,
+    PDZ_GRIPPER_APPROACH_PROFILE,
+    PDZ_GRIPPER_OPEN_WIDTH_M,
+    VISUAL_SERVO_GRIPPER_PROFILE,
+    pdz_gripper_approach_width_from_jaw_width,
 )
 
 
@@ -51,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "--robot-urdf",
         type=Path,
         default=REPO_ROOT
-        / "assets/urdf/kuka_iiwa7_y_gripper/urdf/kuka_iiwa7_y_gripper.urdf",
+        / "assets/urdf/kuka_iiwa7_pdz_gripper/urdf/kuka_iiwa7_pdz_gripper.urdf",
     )
     parser.add_argument("--waypoints", type=int, default=32)
     parser.add_argument("--maximum-position-error-m", type=float, default=5.0e-5)
@@ -237,13 +238,13 @@ def _target_gripper_apertures(
             raise ValueError(f"Target {target_id} is missing world_grasp metadata.")
         jaw_width = float(world_grasp["jaw_width_m"])
         approach_width = float(world_grasp["gripper_width_m"])
-        expected_width = kuka_y_gripper_approach_width_from_jaw_width(jaw_width)
+        expected_width = pdz_gripper_approach_width_from_jaw_width(jaw_width)
         if abs(approach_width - expected_width) > 1.0e-7:
             raise ValueError(
                 f"Target {target_id} approach aperture is {approach_width:.6f} m; "
                 f"expected jaw width + 10 mm = {expected_width:.6f} m."
             )
-        if approach_width > KUKA_Y_GRIPPER_SOURCE_OPEN_WIDTH_M + 1.0e-7:
+        if approach_width > PDZ_GRIPPER_OPEN_WIDTH_M + 1.0e-7:
             raise ValueError(
                 f"Target {target_id} approach aperture exceeds the physical gripper opening."
             )
@@ -381,12 +382,13 @@ def main() -> None:
     # center offset, so the target grasp and target TCP poses are identical.
     payload = {
         "schema_version": np.asarray(
-            3 if multipart_manifest else 1,
+            4 if multipart_manifest else 1,
             dtype=np.int64,
         ),
-        "approach_gripper_profile": np.asarray(KUKA_Y_GRIPPER_APPROACH_PROFILE),
+        "robot_profile": np.asarray(VISUAL_SERVO_GRIPPER_PROFILE),
+        "approach_gripper_profile": np.asarray(PDZ_GRIPPER_APPROACH_PROFILE),
         "approach_clearance_per_finger_m": np.asarray(
-            KUKA_Y_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M, dtype=np.float32
+            PDZ_GRIPPER_APPROACH_CLEARANCE_PER_FINGER_M, dtype=np.float32
         ),
         "source_planned_manifest": np.asarray(str(args.manifest.resolve())),
         "target_ids": np.asarray([str(target["target_id"]) for target in targets]),

@@ -17,6 +17,8 @@ from grasp_planning.d405_wrist_camera import (
 )
 from grasp_planning.envs.fr3_part_env import make_fr3_part_scene_cfg
 from grasp_planning.isaac_visual_scene import make_visual_servo_render_cfg
+from grasp_planning.rl.policy_context import POLICY_CONTEXT_ACTION
+from grasp_planning.rl.policy_timing import PHYSICS_RATE_HZ, POLICY_DECIMATION
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
@@ -25,7 +27,7 @@ from isaaclab.sensors import TiledCameraCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-ROBOT_USD = REPO_ROOT / "assets/usd/kuka_iiwa7_y_gripper/kuka_iiwa7_y_gripper.usda"
+ROBOT_USD = REPO_ROOT / "assets/usd/kuka_iiwa7_pdz_gripper/kuka_iiwa7_pdz_gripper.usd"
 PART_USD = REPO_ROOT / "artifacts/isaac_bundle_assets/pipeline_stage2_ground_feasible_bundle_local.usd"
 LEGACY_GOAL_RESET_DATA = REPO_ROOT / "isaac_rl/data/fixed_goal_reset.npz"
 MULTIGRASP_CATALOG_DATA = REPO_ROOT / "isaac_rl/data/multigrasp_50_catalog.npz"
@@ -64,7 +66,8 @@ _camera_position, _camera_orientation_wxyz = camera_pose_in_link7(_camera_cfg)
 
 @configclass
 class GraspVisualServoEnvCfg(DirectRLEnvCfg):
-    decimation = 4
+    # One policy action and one wrist RGB-D observation every 1/15 second.
+    decimation = POLICY_DECIMATION
     # Maximum training horizon. Individual resets receive shorter timeouts
     # according to path progress and whether they train completion/boundaries.
     episode_length_s = 12.0
@@ -72,17 +75,20 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     # decision. The custom RL-Games model treats only the first six values as
     # Gaussian actions.
     action_space = 7
-    # Flattened 72x128x8 visual input, the previous six motion actions, six
+    # Flattened 72x128x8 visual input, deployment-measurable actor context, six
     # privileged pose targets, one completion label, and one supervision mask.
     # The network excludes the final eight labels from its action path; the
     # preceding action is deployment-available temporal context.
     observation_space = VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8 + 14
+    # Training entrypoints update the observation/network sizes together when
+    # selecting a larger ablation context.
+    policy_context_mode = POLICY_CONTEXT_ACTION
     # The critic remains q, qd, privileged pose error, and the preceding six
     # motion actions. The completion decision is deliberately omitted.
     state_space = 26
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 120.0,
+        dt=1.0 / PHYSICS_RATE_HZ,
         render_interval=decimation,
         render=make_visual_servo_render_cfg(),
     )
@@ -174,10 +180,10 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     reset_rotation_fraction_min = 0.5
     reset_rotation_fraction_max = 1.0
     reset_rotation_far_rad = 15.0 * 3.141592653589793 / 180.0
-    # Optional horizontal object/goal displacement creates a true Cartesian
-    # error relative to the selected nominal robot waypoint.  Runtime sampling
-    # caps every displacement by the collision clearance stored for that exact
-    # target, rotation variant, and waypoint.
+    # Horizontal translation moves the physical object and its part-relative
+    # target together, while the robot stays at its nominal/rotated waypoint.
+    # Runtime sampling caps every displacement by the collision clearance
+    # stored for that exact target, rotation variant, and waypoint.
     reset_position_randomization_enabled = False
     reset_position_far_offset_m = 0.010
     reset_position_near_offset_m = 0.003
@@ -185,6 +191,21 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     reset_position_fraction_min = 0.5
     reset_position_fraction_max = 1.0
     reset_position_clearance_guard_m = 0.0001
+    # In-plane object yaw models error between the nominal perceived part frame
+    # and the stable actual part pose rather than merely rotating the gripper.
+    # Actual poses stay on the catalog support manifold: world Z and roll/pitch
+    # never change. The target TCP follows the same rigid transform and the
+    # canonical goal RGB-D remains unchanged. The sampler conservatively
+    # budgets maximum surface displacement against validated clearance.
+    reset_object_yaw_randomization_enabled = False
+    reset_object_yaw_far_rad = 10.0 * 3.141592653589793 / 180.0
+    reset_object_yaw_near_rad = 3.0 * 3.141592653589793 / 180.0
+    reset_object_yaw_exponent = 1.5
+    reset_object_yaw_fraction_min = 0.0
+    reset_object_yaw_fraction_max = 1.0
+    # Maximum XY vertex radius about the USD/part-frame root, rounded upward
+    # from the scaled source OBJ. Multipart overrides this tuple per part.
+    part_xy_rotation_radii_m = (0.046,)
     # Continuous path/error resets remain the majority, while explicit
     # unperturbed, ready-region, and boundary cases prevent the completion
     # classifier from being starved by a high-dimensional uniform sampler.
@@ -203,7 +224,7 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     curriculum_full_steps = 192_000
     curriculum_initial_progress_min = 0.70
     curriculum_final_progress_min = 0.0
-    # Per-reset time budgets at 30 Hz. Completion-focused resets are short;
+    # Per-reset time budgets at 15 Hz. Completion-focused resets are short;
     # far resets are long enough to exhibit the 7--8 s successes seen in eval.
     reset_timeout_far_s = 12.0
     reset_timeout_close_s = 4.0
@@ -233,7 +254,7 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     live_depth_noise_std_m = (0.0, 0.0002)
     # Provisional documented D405/D400 profile. Device-specific plane captures
     # will replace these ranges without changing the observation contract.
-    sim2real_randomization_profile = "d405_documented_provisional_v5:combined_sim2real"
+    sim2real_randomization_profile = "d405_documented_provisional_v6_15hz:combined_sim2real"
     live_correlated_depth_enabled = True
     live_stereo_focal_length_px = _camera_cfg.fx
     live_stereo_baseline_m = _camera_cfg.stereo_baseline_m
@@ -257,22 +278,24 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     live_calibration_scale = (0.99, 1.01)
     live_calibration_roll_deg = (-1.0, 1.0)
     live_clean_episode_fraction = 0.15
-    # Camera-frame and controller timing at 30 Hz. The completion hold is
+    # Camera-frame and controller timing at 15 Hz. The completion hold is
     # immediate; only live observations and six motion components are delayed.
-    live_observation_delay_max_steps = 2
+    # One 15 Hz step preserves the former maximum ~67 ms delay.
+    live_observation_delay_max_steps = 1
     live_observation_repeat_probability = 0.02
-    motion_action_delay_max_steps = 2
-    motion_action_two_step_probability = 0.08
+    motion_action_delay_max_steps = 1
+    motion_action_two_step_probability = 0.0
     motion_response_scale = (0.88, 1.12)
-    motion_response_alpha = (0.70, 1.0)
+    # 0.91 at 15 Hz has the same time response as 0.70 at 30 Hz.
+    motion_response_alpha = (0.91, 1.0)
     motion_bias = (-0.015, 0.015)
     physics_joint_stiffness_scale = (0.90, 1.10)
     physics_joint_damping_scale = (0.90, 1.10)
     # Change the physical live scene as well as applying sensor-space noise.
     # Rotating the distant key light changes the cast-shadow direction; the
-    # slow cadence keeps each appearance stable for four seconds at 30 Hz.
+    # slow cadence keeps each appearance stable for four seconds at 15 Hz.
     scene_appearance_randomization_enabled = True
-    scene_appearance_randomization_interval_steps = 120
+    scene_appearance_randomization_interval_steps = 60
     # A half-scale T-slot is canonical render/depth geometry. The exact
     # collision surface remains the unchanged flat z=0 plane.
     scene_tslot_surface_enabled = True
@@ -286,6 +309,13 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     scene_clutter_environment_fraction = 0.0
     scene_clutter_min_objects = 1
     scene_clutter_max_objects = 3
+    # Optional larger render/depth-only office/factory layer behind the task.
+    # It contains low-poly walls, storage, screens, safety frames, tabletop
+    # cables, and multiple people, while collision remains the flat plane.
+    scene_busy_background_enabled = False
+    scene_busy_background_environment_fraction = 0.0
+    scene_busy_background_min_people = 2
+    scene_busy_background_max_people = 4
     scene_key_yaw_delta_deg = (-35.0, 35.0)
     scene_key_pitch_delta_deg = (-15.0, 15.0)
     scene_key_intensity_scale = (0.70, 1.30)
@@ -306,7 +336,8 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     scene_ground_roughness = (0.75, 1.0)
     linear_action_scale_m_s = 0.04
     angular_action_scale_rad_s = 0.24
-    action_delta_limit = 0.25
+    # Preserve the former 7.5 normalized-units/s slew limit at 15 Hz.
+    action_delta_limit = 0.50
     dls_damping = 0.08
     # Privileged completion ground truth is used only for training and
     # evaluation. The strict positive and clear negative thresholds leave an
@@ -405,6 +436,8 @@ class GraspVisualServoMultiPartEnvCfg(GraspVisualServoEnvCfg):
     reset_position_randomization_enabled = True
     reset_position_fraction_min = 0.0
     reset_position_fraction_max = 1.0
+    reset_object_yaw_randomization_enabled = True
+    part_xy_rotation_radii_m = (0.046, 0.055, 0.084, 0.055, 0.055)
     training_reset_mixture_enabled = True
     training_curriculum_enabled = True
     variable_reset_timeouts_enabled = True
@@ -425,6 +458,8 @@ class GraspVisualServoMultiPartEnvCfg_PLAY(GraspVisualServoMultiPartEnvCfg):
     reset_rotation_fraction_max = 1.0
     reset_position_fraction_min = 1.0
     reset_position_fraction_max = 1.0
+    reset_object_yaw_fraction_min = 1.0
+    reset_object_yaw_fraction_max = 1.0
     live_observation_randomization_enabled = False
     scene_appearance_randomization_enabled = False
     scene_tslot_geometry_randomization_enabled = False

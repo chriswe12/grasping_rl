@@ -363,6 +363,50 @@ in the same split. MoveIt reachability filtering recomputes the split over only
 surviving targets. This prevents a geometrically identical grasp from leaking
 between training and held-out evaluation.
 
+### All-Fabrica grasp catalog
+
+`configs/fabrica_all_v1.yaml` defines the versioned 46-part source inventory
+and the low-cap all-assembly rollout from
+`FABRICA_ALL_RL_DATASET_IMPLEMENTATION_PLAN.md`. The builder keeps the existing
+PDZ geometry, 10 mm total approach clearance, stable-pose, assembly-collision,
+ground, MoveIt, and reset-collision contracts. A part that cannot pass them is
+recorded with a machine-readable exclusion reason; the builder does not relax
+the filters to force coverage.
+
+Run every CPU stage, including the all-part PDZ grasp benchmark, namespaced
+manifest build, MoveIt validation, path generation, and rotation-reset
+validation:
+
+```bash
+cd /media/pdz/Elements1/Grasp_Planning_grasping_rl
+python3 isaac_rl/scripts/prepare_fabrica_catalog.py \
+  --config configs/fabrica_all_v1.yaml --stage cpu --jobs 4
+```
+
+The build is resumable. Run one stage with `--stage inventory`, `sources`,
+`manifest`, `merge`, `plan`, `paths`, or `rotation`; use `--force-sources` or
+`--force-replan` only when the corresponding cache must be invalidated. Large
+artifacts remain under `isaac_rl/data/fabrica_all_v1/` and
+`artifacts/grasp_generation_benchmark_pdz/`, outside normal Git history.
+
+Identifiers are globally stable across assemblies, for example
+`beam__part_0__orientation_003__g0147`. The merged manifest also records the
+primary held-out-grasp split plus held-out-part and held-out-assembly evaluation
+views. `dataset_index.json` and `reports/` distinguish geometry-selected grasps
+from a fully training-ready catalog.
+
+After the CPU stages pass, capture the canonical MuJoCo Filament goal RGB-D
+catalog and enforce exact goal/path/reset target alignment:
+
+```bash
+python3 isaac_rl/scripts/prepare_fabrica_catalog.py \
+  --config configs/fabrica_all_v1.yaml --stage mujoco
+```
+
+The legacy plumbers-block task and artifacts remain separate for old checkpoint
+reproducibility. A sharded all-Fabrica Isaac task must consume the future shard
+products rather than loading all 46 rigid objects in every environment.
+
 The current checked-in, Isaac-validated catalog contains 1,256 usable targets:
 1,012 train, 125 validation, and 119 test. Every target has a 32-waypoint nominal path and
 eight distinct position-preserving rotation paths reaching 15 degrees at
