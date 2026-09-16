@@ -152,9 +152,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             # environments and silently overflows during the initial contact
             # solve.  2**19 covers the measured ~386k-patch peak while keeping
             # substantially more headroom than the default.
-            cfg.sim.physx.gpu_max_rigid_patch_count = max(
-                int(cfg.sim.physx.gpu_max_rigid_patch_count), 2**19
-            )
+            cfg.sim.physx.gpu_max_rigid_patch_count = max(int(cfg.sim.physx.gpu_max_rigid_patch_count), 2**19)
             for actuator_name in ("hand_driver", "hand_follower"):
                 actuator = cfg.robot_cfg.actuators.get(actuator_name)
                 if actuator is None:
@@ -199,9 +197,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                 ),
                 light_paths=self.visual_light_paths,
                 material_paths=self.visual_material_bindings["materials"],
-                gripper_variant_paths=self.visual_material_bindings[
-                    "gripper_appearance_variant_roots"
-                ],
+                gripper_variant_paths=self.visual_material_bindings["gripper_appearance_variant_roots"],
                 device=self.device,
             )
             self.scene_appearance_randomizer.maybe_randomize(
@@ -347,9 +343,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                 depth_edge_threshold_m=float(self.cfg.live_depth_edge_threshold_m),
                 rgb_patch_occlusion_probability=float(self.cfg.live_rgb_patch_occlusion_probability),
                 depth_patch_dropout_probability=float(self.cfg.live_depth_patch_dropout_probability),
-                depth_structured_dropout_probability=float(
-                    self.cfg.live_depth_structured_dropout_probability
-                ),
+                depth_structured_dropout_probability=float(self.cfg.live_depth_structured_dropout_probability),
                 depth_structured_dropout_seed_probability=tuple(
                     self.cfg.live_depth_structured_dropout_seed_probability
                 ),
@@ -465,9 +459,7 @@ class GraspVisualServoEnv(DirectRLEnv):
         if len(configured_rotation_radii) != len(self.part_names) or any(
             value <= 0.0 for value in configured_rotation_radii
         ):
-            raise ValueError(
-                "part_xy_rotation_radii_m must contain one positive radius for every configured part."
-            )
+            raise ValueError("part_xy_rotation_radii_m must contain one positive radius for every configured part.")
         self.part_xy_rotation_radii = torch.as_tensor(
             configured_rotation_radii,
             dtype=torch.float32,
@@ -585,9 +577,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             if bool(self.cfg.goal_live_color_relationship_required):
                 raise ValueError(message)
             print(f"[WARNING] {message} Falling back to independent live colors.", flush=True)
-        self.goal_color_relationship_code = torch.full(
-            (self.num_envs,), -1, dtype=torch.long, device=self.device
-        )
+        self.goal_color_relationship_code = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
         self.goal_palette_index = torch.full_like(self.goal_color_relationship_code, -1)
         self.live_palette_index = torch.full_like(self.goal_color_relationship_code, -1)
         self.goal_tcp_position = self.goal_tcp_positions_catalog[0:1].repeat(self.num_envs, 1)
@@ -656,12 +646,10 @@ class GraspVisualServoEnv(DirectRLEnv):
                 flush=True,
             )
         if (
-            self.cfg.reset_position_randomization_enabled
-            or self.cfg.reset_object_yaw_randomization_enabled
+            self.cfg.reset_position_randomization_enabled or self.cfg.reset_object_yaw_randomization_enabled
         ) and self.rotation_reset_collision_clearance is None:
             raise ValueError(
-                "Object-pose reset randomization requires a rotation-reset asset with per-state "
-                "collision clearances."
+                "Object-pose reset randomization requires a rotation-reset asset with per-state collision clearances."
             )
 
     def _legacy_single_goal_catalog(self) -> dict[str, np.ndarray]:
@@ -763,9 +751,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             clean_fraction=float(self.cfg.scene_surface_markings_clean_fraction),
             min_markings=int(self.cfg.scene_surface_markings_min_count),
             max_markings=int(self.cfg.scene_surface_markings_max_count),
-            target_clearance_radius_m=float(
-                self.cfg.scene_surface_markings_target_clearance_radius_m
-            ),
+            target_clearance_radius_m=float(self.cfg.scene_surface_markings_target_clearance_radius_m),
         )
         self.clutter_visual_bindings = spawn_visual_servo_clutter(
             self.num_envs,
@@ -862,9 +848,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             )
             selected_ids = env_ids[selected_parts == part_index]
             if selected_ids.numel() > 0:
-                selected_cpu_ids = selected_ids.detach().to(
-                    device="cpu", dtype=torch.long
-                )
+                selected_cpu_ids = selected_ids.detach().to(device="cpu", dtype=torch.long)
                 disabled[selected_cpu_ids] = 0
             part.root_physx_view.set_disable_simulations(disabled, cpu_env_ids)
             if selected_ids.numel() > 0:
@@ -995,9 +979,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             )
         if actions.shape[-1] != 7:
             raise ValueError(f"Expected six motion actions plus completion, got shape {tuple(actions.shape)}.")
-        scripted_at_start = bool(self.cfg.lift_reward_enabled) & (
-            self.lift_phase != self._LIFT_PHASE_APPROACH
-        )
+        scripted_at_start = bool(self.cfg.lift_reward_enabled) & (self.lift_phase != self._LIFT_PHASE_APPROACH)
         self.lift_policy_transition.copy_(~scripted_at_start)
         self.lift_commit_event.zero_()
         requested_actions = actions[:, :6].clamp(-1.0, 1.0)
@@ -1044,8 +1026,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             )
         )
         self.completion_declaration.copy_(
-            eligible
-            & (self.completion_streak >= int(self.cfg.completion_required_consecutive_steps))
+            eligible & (self.completion_streak >= int(self.cfg.completion_required_consecutive_steps))
         )
         if bool(self.cfg.lift_reward_enabled):
             self._begin_lift_attempts()
@@ -1137,9 +1118,9 @@ class GraspVisualServoEnv(DirectRLEnv):
         # Slice environments first, then joints. Indexing both dimensions in
         # one expression makes PyTorch treat env_ids and arm_ids as paired
         # advanced indices, which fails whenever their lengths differ.
-        jacobian = self.robot.root_physx_view.get_jacobians()[
-            env_ids, self.context.ee_jacobi_body_idx
-        ][:, :, self.arm_ids]
+        jacobian = self.robot.root_physx_view.get_jacobians()[env_ids, self.context.ee_jacobi_body_idx][
+            :, :, self.arm_ids
+        ]
         transpose = jacobian.transpose(1, 2)
         identity = torch.eye(6, device=self.device).expand(env_ids.numel(), -1, -1)
         return torch.bmm(
@@ -1281,9 +1262,7 @@ class GraspVisualServoEnv(DirectRLEnv):
 
         close_steps = self._lift_phase_steps(float(self.cfg.lift_close_duration_s))
         release_steps = self._lift_phase_steps(float(self.cfg.lift_gravity_release_duration_s))
-        lift_steps = self._lift_phase_steps(
-            float(self.cfg.lift_height_m) / float(self.cfg.lift_speed_m_s)
-        )
+        lift_steps = self._lift_phase_steps(float(self.cfg.lift_height_m) / float(self.cfg.lift_speed_m_s))
         hold_steps = self._lift_phase_steps(float(self.cfg.lift_hold_duration_s))
 
         phase_at_start = self.lift_phase.clone()
@@ -1293,8 +1272,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             target_indices = self.target_index[close_mask]
             approach_width = self.approach_gripper_widths_catalog[target_indices]
             close_width = torch.clamp(
-                self.grasp_jaw_widths_catalog[target_indices]
-                - float(self.cfg.lift_squeeze_margin_m),
+                self.grasp_jaw_widths_catalog[target_indices] - float(self.cfg.lift_squeeze_margin_m),
                 min=PDZ_GRIPPER_CLOSED_WIDTH_M,
             )
             widths = torch.lerp(approach_width, close_width, progress.clamp(0.0, 1.0))
@@ -1327,9 +1305,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                 tcp_position, _ = self.context.get_tcp_pose_w()
                 self.lift_prelift_object_position[first_lift] = object_position[first_lift]
                 self.lift_prelift_tcp_position[first_lift] = tcp_position[first_lift]
-                self.lift_initial_relative_position[first_lift] = (
-                    object_position[first_lift] - tcp_position[first_lift]
-                )
+                self.lift_initial_relative_position[first_lift] = object_position[first_lift] - tcp_position[first_lift]
                 self.lift_peak_object_z[first_lift] = object_position[first_lift, 2]
             object_position, _ = self._active_part_pose()
             self.lift_peak_object_z[lift_mask] = torch.maximum(
@@ -1481,9 +1457,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                 completion_supervised,
                 -torch.ones_like(completion_supervised),
             )
-        completion_target = torch.stack(
-            (labels.ready.float(), completion_supervised.float()), dim=-1
-        )
+        completion_target = torch.stack((labels.ready.float(), completion_supervised.float()), dim=-1)
         policy_context = self._policy_context(tcp_quaternion)
         policy_observation = torch.cat(
             (
@@ -1515,9 +1489,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             dim=-1,
         )
         tcp_lift = tcp_position[:, 2] - self.lift_prelift_tcp_position[:, 2]
-        arm_ok = tcp_lift >= (
-            float(self.cfg.lift_minimum_arm_fraction) * float(self.cfg.lift_height_m)
-        )
+        arm_ok = tcp_lift >= (float(self.cfg.lift_minimum_arm_fraction) * float(self.cfg.lift_height_m))
         quality = retained_lift_quality(
             final_height,
             peak_height,
@@ -1550,11 +1522,11 @@ class GraspVisualServoEnv(DirectRLEnv):
         position_norm = torch.linalg.norm(position_error, dim=-1)
         rotation_norm = torch.linalg.norm(rotation_error, dim=-1)
         lift_enabled = bool(self.cfg.lift_reward_enabled)
-        lift_terminal = self._finalize_lift_outcomes() if lift_enabled else torch.zeros_like(
-            self.completion_declaration
+        lift_terminal = (
+            self._finalize_lift_outcomes() if lift_enabled else torch.zeros_like(self.completion_declaration)
         )
-        policy_transition = self.lift_policy_transition if lift_enabled else torch.ones_like(
-            self.completion_declaration
+        policy_transition = (
+            self.lift_policy_transition if lift_enabled else torch.ones_like(self.completion_declaration)
         )
         contact_force = self._gripper_contact_force()
         collision = contact_force >= float(self.cfg.unsafe_contact_force_threshold_n)
@@ -1662,9 +1634,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             # drift (a gray-band declaration could otherwise earn more than an
             # exact declaration).  Do not soften negative premature penalties.
             positive_reset_bonus = (
-                completion_terminal
-                & self.completion_positive_reset
-                & (terminal_completion_reward > 0.0)
+                completion_terminal & self.completion_positive_reset & (terminal_completion_reward > 0.0)
             )
             terminal_completion_reward = torch.where(
                 positive_reset_bonus,
@@ -1706,29 +1676,22 @@ class GraspVisualServoEnv(DirectRLEnv):
         near_goal_action_cost = near_goal.float() * action_norm.square()
         action_delta_cost = action_delta_norm.square()
         near_goal_regression = near_goal.float() * (
-            torch.relu(position_norm - self.previous_position_error)
-            / float(self.cfg.position_precision_scale_m)
-            + torch.relu(rotation_norm - self.previous_rotation_error)
-            / float(self.cfg.rotation_precision_scale_rad)
+            torch.relu(position_norm - self.previous_position_error) / float(self.cfg.position_precision_scale_m)
+            + torch.relu(rotation_norm - self.previous_rotation_error) / float(self.cfg.rotation_precision_scale_rad)
         )
         reward -= active * time_cost_scale * float(self.cfg.near_goal_action_penalty_weight) * near_goal_action_cost
         reward -= active * time_cost_scale * float(self.cfg.action_delta_penalty_weight) * action_delta_cost
         reward -= active * float(self.cfg.near_goal_regression_penalty_weight) * near_goal_regression
         linear_speed, angular_speed = self._tcp_speed()
-        excess_linear_speed = torch.relu(
-            linear_speed - float(self.cfg.completion_max_linear_speed_m_s)
-        ) / float(self.cfg.linear_action_scale_m_s)
-        excess_angular_speed = torch.relu(
-            angular_speed - float(self.cfg.completion_max_angular_speed_rad_s)
-        ) / float(self.cfg.angular_action_scale_rad_s)
-        near_goal_excess_speed = near_goal.float() * (
-            excess_linear_speed.square() + excess_angular_speed.square()
+        excess_linear_speed = torch.relu(linear_speed - float(self.cfg.completion_max_linear_speed_m_s)) / float(
+            self.cfg.linear_action_scale_m_s
         )
+        excess_angular_speed = torch.relu(angular_speed - float(self.cfg.completion_max_angular_speed_rad_s)) / float(
+            self.cfg.angular_action_scale_rad_s
+        )
+        near_goal_excess_speed = near_goal.float() * (excess_linear_speed.square() + excess_angular_speed.square())
         reward -= (
-            active
-            * time_cost_scale
-            * float(self.cfg.near_goal_excess_speed_penalty_weight)
-            * near_goal_excess_speed
+            active * time_cost_scale * float(self.cfg.near_goal_excess_speed_penalty_weight) * near_goal_excess_speed
         )
         self.previous_position_error.copy_(position_norm)
         self.previous_rotation_error.copy_(rotation_norm)
@@ -1777,18 +1740,15 @@ class GraspVisualServoEnv(DirectRLEnv):
             "lift/pickup_success_rate": physical_completion.float().mean(),
             "lift/task_success_rate": task_completion.float().mean(),
             "lift/phase_active_rate": (~policy_transition).float().mean(),
-            "lift/commit_operational_rate": (
-                self.lift_commit_event & self.lift_commit_operational
-            ).float().mean(),
-            "lift/final_height_mm": (
-                self.lift_final_height * lift_terminal.float()
-            ).sum() / lift_terminal.float().sum().clamp_min(1.0) * 1000.0,
-            "lift/quality": (
-                self.lift_quality * lift_terminal.float()
-            ).sum() / lift_terminal.float().sum().clamp_min(1.0),
-            "lift/relative_drift_mm": (
-                self.lift_relative_drift * lift_terminal.float()
-            ).sum() / lift_terminal.float().sum().clamp_min(1.0) * 1000.0,
+            "lift/commit_operational_rate": (self.lift_commit_event & self.lift_commit_operational).float().mean(),
+            "lift/final_height_mm": (self.lift_final_height * lift_terminal.float()).sum()
+            / lift_terminal.float().sum().clamp_min(1.0)
+            * 1000.0,
+            "lift/quality": (self.lift_quality * lift_terminal.float()).sum()
+            / lift_terminal.float().sum().clamp_min(1.0),
+            "lift/relative_drift_mm": (self.lift_relative_drift * lift_terminal.float()).sum()
+            / lift_terminal.float().sum().clamp_min(1.0)
+            * 1000.0,
             "completion/strict_ready_rate": strict_ready.float().mean(),
             "completion/geometric_ready_rate": labels.ready.float().mean(),
             "completion/operational_ready_rate": labels.ready.float().mean(),
@@ -1797,9 +1757,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             "completion/declaration_rate": declaration_event.float().mean(),
             "completion/premature_rate": premature_completion.float().mean(),
             "completion/borderline_declaration_rate": borderline_completion.float().mean(),
-            "completion/missed_ready_rate": (
-                labels.ready & ~declaration_event & policy_transition
-            ).float().mean(),
+            "completion/missed_ready_rate": (labels.ready & ~declaration_event & policy_transition).float().mean(),
             "completion/missed_operational_timeout_rate": missed_operational_timeout.float().mean(),
             # Stochastic PPO rollouts send the Bernoulli draw (0/1), so this
             # is an unbiased batch estimate of mean p(done). Deterministic
@@ -1825,9 +1783,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             .float()
             .mean(),
             "reset/object_yaw_deg": self.reset_object_yaw_offset.abs().mean() * 180.0 / torch.pi,
-            "reset/object_yaw_requested_deg": (
-                self.reset_object_yaw_requested.mean() * 180.0 / torch.pi
-            ),
+            "reset/object_yaw_requested_deg": (self.reset_object_yaw_requested.mean() * 180.0 / torch.pi),
             "reset/object_yaw_capped_rate": (
                 self.reset_object_yaw_offset.abs() + 1.0e-9 < self.reset_object_yaw_requested
             )
@@ -1881,9 +1837,7 @@ class GraspVisualServoEnv(DirectRLEnv):
                     "appearance/key_intensity": position_norm.new_tensor(appearance.key_intensity),
                     "appearance/key_angle_deg": position_norm.new_tensor(appearance.key_angle_deg),
                     "appearance/dome_intensity": position_norm.new_tensor(appearance.dome_intensity),
-                    "appearance/gripper_canonical": position_norm.new_tensor(
-                        float(appearance.gripper_canonical)
-                    ),
+                    "appearance/gripper_canonical": position_norm.new_tensor(float(appearance.gripper_canonical)),
                     "appearance/finger_roughness": position_norm.new_tensor(appearance.finger_roughness),
                     "appearance/pad_roughness": position_norm.new_tensor(appearance.pad_roughness),
                 }
@@ -1893,21 +1847,23 @@ class GraspVisualServoEnv(DirectRLEnv):
                 {
                     "appearance/canonical_part_fraction": (
                         self.live_workspace_appearance_randomizer.part_palette_index == 0
-                    ).float().mean(),
+                    )
+                    .float()
+                    .mean(),
                     "appearance/nominal_tslot_fraction": (
                         self.live_workspace_appearance_randomizer.background_index == 0
-                    ).float().mean(),
+                    )
+                    .float()
+                    .mean(),
                     "appearance/clutter_environment_fraction": position_norm.new_tensor(
-                        float(self.clutter_visual_bindings.get("active_environment_count", 0))
-                        / float(self.num_envs)
+                        float(self.clutter_visual_bindings.get("active_environment_count", 0)) / float(self.num_envs)
                     ),
                     "appearance/busy_background_environment_fraction": position_norm.new_tensor(
                         float(self.busy_background_visual_bindings.get("active_environment_count", 0))
                         / float(self.num_envs)
                     ),
                     "appearance/busy_background_people_per_environment": position_norm.new_tensor(
-                        float(self.busy_background_visual_bindings.get("people_count", 0))
-                        / float(self.num_envs)
+                        float(self.busy_background_visual_bindings.get("people_count", 0)) / float(self.num_envs)
                     ),
                     "appearance/surface_marking_environment_fraction": position_norm.new_tensor(
                         float(self.surface_marking_visual_bindings.get("active_environment_count", 0))
@@ -1915,20 +1871,22 @@ class GraspVisualServoEnv(DirectRLEnv):
                     ),
                     "appearance/goal_live_color_match_rate": (
                         self.goal_color_relationship_code == COLOR_RELATIONSHIP_MATCH
-                    ).float().mean(),
+                    )
+                    .float()
+                    .mean(),
                     "appearance/goal_live_color_similar_rate": (
                         self.goal_color_relationship_code == COLOR_RELATIONSHIP_SIMILAR
-                    ).float().mean(),
+                    )
+                    .float()
+                    .mean(),
                     "appearance/goal_live_color_different_rate": (
                         self.goal_color_relationship_code == COLOR_RELATIONSHIP_DIFFERENT
-                    ).float().mean(),
+                    )
+                    .float()
+                    .mean(),
                     "appearance/busy_background_worker_reaches_per_environment": (
                         position_norm.new_tensor(
-                            float(
-                                self.busy_background_visual_bindings.get(
-                                    "worker_reach_count", 0
-                                )
-                            )
+                            float(self.busy_background_visual_bindings.get("worker_reach_count", 0))
                             / float(self.num_envs)
                         )
                     ),
@@ -2037,9 +1995,7 @@ class GraspVisualServoEnv(DirectRLEnv):
             log[f"{bucket}/rotation_error_deg"] = (
                 reported_rotation_norm.masked_fill(~mask, 0.0).sum() / sample_count * 180.0 / torch.pi
             )
-            log[f"{bucket}/success_rate"] = (
-                strict_completion.float().masked_fill(~mask, 0.0).sum() / sample_count
-            )
+            log[f"{bucket}/success_rate"] = strict_completion.float().masked_fill(~mask, 0.0).sum() / sample_count
             log[f"{bucket}/operational_success_rate"] = (
                 operational_completion.float().masked_fill(~mask, 0.0).sum() / sample_count
             )
@@ -2055,9 +2011,7 @@ class GraspVisualServoEnv(DirectRLEnv):
         if bool(self.cfg.lift_reward_enabled):
             approach = self.lift_phase == self._LIFT_PHASE_APPROACH
             return (
-                (self.lift_phase == self._LIFT_PHASE_OUTCOME)
-                | (diverged & approach)
-                | (collision & approach),
+                (self.lift_phase == self._LIFT_PHASE_OUTCOME) | (diverged & approach) | (collision & approach),
                 timed_out & approach,
             )
         return self.completion_declaration | diverged | collision, timed_out
@@ -2224,9 +2178,13 @@ class GraspVisualServoEnv(DirectRLEnv):
                 similar_fraction=float(self.cfg.goal_live_color_similar_fraction),
                 device=self.device,
             )
-            selected_variant_rgb = self.goal_rgb_policy_variants_cpu[
-                target_indices.detach().cpu(), color_pairs.goal_variant_slots.detach().cpu()
-            ].to(device=self.device, dtype=torch.float32).div_(255.0)
+            selected_variant_rgb = (
+                self.goal_rgb_policy_variants_cpu[
+                    target_indices.detach().cpu(), color_pairs.goal_variant_slots.detach().cpu()
+                ]
+                .to(device=self.device, dtype=torch.float32)
+                .div_(255.0)
+            )
             self.goal_rgbd[env_ids, ..., :3] = selected_variant_rgb
             forced_live_palette_indices = color_pairs.live_palette_indices
             self.goal_color_relationship_code[env_ids] = color_pairs.relationship_codes
@@ -2292,8 +2250,7 @@ class GraspVisualServoEnv(DirectRLEnv):
         selected_part_indices = self.target_part_indices[target_indices]
         selected_clearance: torch.Tensor | None = None
         object_pose_randomization_enabled = bool(
-            self.cfg.reset_position_randomization_enabled
-            or self.cfg.reset_object_yaw_randomization_enabled
+            self.cfg.reset_position_randomization_enabled or self.cfg.reset_object_yaw_randomization_enabled
         )
         if object_pose_randomization_enabled:
             if not collision_safe_sampling or progress_indices is None or variant_indices is None:

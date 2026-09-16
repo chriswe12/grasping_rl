@@ -211,9 +211,7 @@ def _summarize(rows: list[dict[str, object]]) -> dict[str, object]:
         "reset_position_offset_mm_mean": mean(float(row["reset_position_offset_mm"]) for row in rows),
         "reset_position_requested_mm_mean": mean(float(row["reset_position_requested_mm"]) for row in rows),
         "reset_object_yaw_deg_mean": mean(abs(float(row["reset_object_yaw_deg"])) for row in rows),
-        "reset_object_yaw_requested_deg_mean": mean(
-            float(row["reset_object_yaw_requested_deg"]) for row in rows
-        ),
+        "reset_object_yaw_requested_deg_mean": mean(float(row["reset_object_yaw_requested_deg"]) for row in rows),
         "final_completion_probability_mean": mean(float(row["final_completion_probability"]) for row in rows),
     }
 
@@ -689,9 +687,7 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                         "reset_position_offset_mm": float(reset_position[env_index]),
                         "reset_position_requested_mm": float(reset_position_requested[env_index]),
                         "reset_object_yaw_deg": float(reset_object_yaw[env_index]),
-                        "reset_object_yaw_requested_deg": float(
-                            reset_object_yaw_requested[env_index]
-                        ),
+                        "reset_object_yaw_requested_deg": float(reset_object_yaw_requested[env_index]),
                         "initial_position_error_mm": float(initial_position[env_index]),
                         "initial_rotation_error_deg": float(initial_rotation[env_index]),
                         "final_position_error_mm": float(final_position[env_index]),
@@ -717,10 +713,7 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
 
     completion_summaries = {
         "overall": completion_diagnostics_overall.summary(),
-        **{
-            condition: diagnostics.summary()
-            for condition, diagnostics in completion_diagnostics_by_condition.items()
-        },
+        **{condition: diagnostics.summary() for condition, diagnostics in completion_diagnostics_by_condition.items()},
     }
     payload, target_rows, markdown = _build_report(
         checkpoint=checkpoint,

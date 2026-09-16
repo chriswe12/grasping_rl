@@ -865,9 +865,7 @@ def main() -> None:  # noqa: C901 - one bounded simulator experiment
                     "actual_close_width_m": float(values["actual_close_width"][env_index]),
                     "settle_translation_m": float(values["settle_translation"][env_index]),
                     "settle_rotation_deg": math.degrees(float(values["settle_rotation"][env_index])),
-                    "settle_peak_gripper_contact_force_n": float(
-                        values["settle_peak_contact_force"][env_index]
-                    ),
+                    "settle_peak_gripper_contact_force_n": float(values["settle_peak_contact_force"][env_index]),
                     "settle_peak_left_finger_contact_force_n": float(
                         values["settle_peak_left_finger_force"][env_index]
                     ),

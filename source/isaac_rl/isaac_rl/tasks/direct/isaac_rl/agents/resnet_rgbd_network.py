@@ -253,12 +253,8 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         if obs_dict.get("is_train", True):
             policy_train_mask = (completion_target[:, 1] >= 0.0).to(dtype=pose_prediction.dtype)
             active_count = policy_train_mask.sum().clamp_min(1.0)
-            position_loss = F.smooth_l1_loss(
-                pose_prediction[:, :3], pose_target[:, :3], reduction="none"
-            ).mean(dim=-1)
-            rotation_loss = F.smooth_l1_loss(
-                pose_prediction[:, 3:], pose_target[:, 3:], reduction="none"
-            ).mean(dim=-1)
+            position_loss = F.smooth_l1_loss(pose_prediction[:, :3], pose_target[:, :3], reduction="none").mean(dim=-1)
+            rotation_loss = F.smooth_l1_loss(pose_prediction[:, 3:], pose_target[:, 3:], reduction="none").mean(dim=-1)
             position_loss = (position_loss * policy_train_mask).sum() / active_count
             rotation_loss = (rotation_loss * policy_train_mask).sum() / active_count
             self.aux_loss_map["pose_aux_loss"] = self.pose_loss_weight * (position_loss + rotation_loss)

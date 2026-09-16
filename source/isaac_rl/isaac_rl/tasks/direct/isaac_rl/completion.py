@@ -79,12 +79,10 @@ def completion_quality(
     )
     del masks  # validation is shared with the binary label contract above
     position_quality = (
-        (float(negative_position_m) - position_error_m)
-        / (float(negative_position_m) - float(ready_position_m))
+        (float(negative_position_m) - position_error_m) / (float(negative_position_m) - float(ready_position_m))
     ).clamp(0.0, 1.0)
     rotation_quality = (
-        (float(negative_rotation_rad) - rotation_error_rad)
-        / (float(negative_rotation_rad) - float(ready_rotation_rad))
+        (float(negative_rotation_rad) - rotation_error_rad) / (float(negative_rotation_rad) - float(ready_rotation_rad))
     ).clamp(0.0, 1.0)
     quality = torch.minimum(position_quality, rotation_quality)
     if collision_free is not None:
@@ -136,10 +134,7 @@ def graded_completion_terminal_reward(
     if not torch.is_floating_point(quality):
         raise ValueError("quality must be a floating-point tensor.")
     bounded_quality = quality.clamp(0.0, 1.0)
-    declared_reward = (
-        -float(premature_penalty)
-        + (float(correct_reward) + float(premature_penalty)) * bounded_quality
-    )
+    declared_reward = -float(premature_penalty) + (float(correct_reward) + float(premature_penalty)) * bounded_quality
     return declared.float() * declared_reward
 
 

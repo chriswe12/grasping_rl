@@ -402,8 +402,7 @@ def main(env_cfg, agent_cfg: dict) -> None:
             env_cfg.scene_busy_background_environment_fraction = 1.0
             diagnostic_overrides["scene_busy_background_environment_fraction"] = 1.0
     print(
-        f"[INFO] Debug-video sim-to-real profile: {sim2real_profile.identifier} "
-        f"({sim2real_profile.description})",
+        f"[INFO] Debug-video sim-to-real profile: {sim2real_profile.identifier} ({sim2real_profile.description})",
         flush=True,
     )
     if diagnostic_overrides:

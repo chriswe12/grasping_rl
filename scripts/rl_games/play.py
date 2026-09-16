@@ -220,9 +220,7 @@ class PlaybackMetricsRecorder:
             "target_id": self.task_env.target_ids[target_index],
             "initial_position_error_mm": initial_position_mm,
             "initial_rotation_error_deg": initial_rotation_deg,
-            "reset_position_offset_mm": _scalar(
-                torch.linalg.norm(self.task_env.reset_position_offset, dim=-1)
-            )
+            "reset_position_offset_mm": _scalar(torch.linalg.norm(self.task_env.reset_position_offset, dim=-1))
             * 1000.0,
             "samples": [],
         }

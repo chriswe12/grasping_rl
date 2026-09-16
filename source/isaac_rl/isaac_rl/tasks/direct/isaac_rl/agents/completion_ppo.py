@@ -143,18 +143,14 @@ class GraspCompletionPpoAgent(A2CAgent):
 
         observations = self.experience_buffer.tensor_dict["obses"]
         if not isinstance(observations, torch.Tensor):
-            return super().discount_values(
-                fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards
-            )
+            return super().discount_values(fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards)
         scripted = self._policy_train_mask(observations) < 0.5
         final_observation = self.obs["obs"] if isinstance(self.obs, dict) else self.obs
         final_scripted = self._policy_train_mask(final_observation) < 0.5
         next_scripted = torch.cat((scripted[1:], final_scripted.unsqueeze(0)), dim=0)
         option_transition = scripted | next_scripted
         if not option_transition.any():
-            return super().discount_values(
-                fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards
-            )
+            return super().discount_values(fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards)
 
         last_gae = torch.zeros_like(last_extrinsic_values)
         advantages = torch.zeros_like(mb_rewards)
@@ -391,11 +387,12 @@ class GraspCompletionPpoAgent(A2CAgent):
             "central_gradient_buffer_mib": central_reducer.size_mib if central_reducer is not None else 0.0,
         }
         try:
-            status_lines = Path('/proc/self/status').read_text().splitlines()
-            row['cpu_rss_mib'] = float(next(line.split()[1] for line in status_lines
-                                             if line.startswith('VmRSS:'))) / 1024.0
+            status_lines = Path("/proc/self/status").read_text().splitlines()
+            row["cpu_rss_mib"] = (
+                float(next(line.split()[1] for line in status_lines if line.startswith("VmRSS:"))) / 1024.0
+            )
         except (OSError, StopIteration, ValueError):
-            row['cpu_rss_mib'] = 0.0
+            row["cpu_rss_mib"] = 0.0
         path = Path(self.experiment_dir) / f"gpu_memory_rank_{self.global_rank}.csv"
         try:
             write_header = not path.exists()

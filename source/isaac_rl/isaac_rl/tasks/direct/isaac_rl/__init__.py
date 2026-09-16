@@ -37,12 +37,8 @@ gym.register(
     entry_point=f"{__name__}.isaac_rl_env:GraspVisualServoEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            f"{__name__}.isaac_rl_env_cfg:GraspVisualServoMultiPartEnvCfg"
-        ),
-        "rl_games_cfg_entry_point": (
-            f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
-        ),
+        "env_cfg_entry_point": (f"{__name__}.isaac_rl_env_cfg:GraspVisualServoMultiPartEnvCfg"),
+        "rl_games_cfg_entry_point": (f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"),
     },
 )
 
@@ -51,12 +47,8 @@ gym.register(
     entry_point=f"{__name__}.isaac_rl_env:GraspVisualServoEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            f"{__name__}.isaac_rl_env_cfg:GraspVisualServoMultiPartEnvCfg_PLAY"
-        ),
-        "rl_games_cfg_entry_point": (
-            f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
-        ),
+        "env_cfg_entry_point": (f"{__name__}.isaac_rl_env_cfg:GraspVisualServoMultiPartEnvCfg_PLAY"),
+        "rl_games_cfg_entry_point": (f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"),
     },
 )
 
@@ -75,12 +67,8 @@ gym.register(
     entry_point=f"{__name__}.isaac_rl_env:GraspVisualServoEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            f"{__name__}.isaac_rl_env_cfg:GraspVisualServoFabricaAllEnvCfg"
-        ),
-        "rl_games_cfg_entry_point": (
-            f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
-        ),
+        "env_cfg_entry_point": (f"{__name__}.isaac_rl_env_cfg:GraspVisualServoFabricaAllEnvCfg"),
+        "rl_games_cfg_entry_point": (f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"),
     },
 )
 
@@ -89,11 +77,7 @@ gym.register(
     entry_point=f"{__name__}.isaac_rl_env:GraspVisualServoEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            f"{__name__}.isaac_rl_env_cfg:GraspVisualServoFabricaAllEnvCfg_PLAY"
-        ),
-        "rl_games_cfg_entry_point": (
-            f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"
-        ),
+        "env_cfg_entry_point": (f"{__name__}.isaac_rl_env_cfg:GraspVisualServoFabricaAllEnvCfg_PLAY"),
+        "rl_games_cfg_entry_point": (f"{agents.__name__}:rl_games_multipart_ppo_cfg.yaml"),
     },
 )

@@ -69,13 +69,8 @@ from grasp_planning.visual_servo_workspace import VISUAL_SERVO_TSLOT_PROFILE  # 
 # Import this leaf validator directly. Importing it through the ``isaac_rl``
 # package eagerly imports Isaac Lab tasks, while this renderer deliberately
 # runs in lightweight system Python with MuJoCo/Filament only.
-_CATALOG_MODULE_PATH = (
-    REPO_ROOT
-    / "isaac_rl/source/isaac_rl/isaac_rl/tasks/direct/isaac_rl/multigrasp_catalog.py"
-)
-_catalog_spec = importlib.util.spec_from_file_location(
-    "_pdz_multigrasp_catalog", _CATALOG_MODULE_PATH
-)
+_CATALOG_MODULE_PATH = REPO_ROOT / "isaac_rl/source/isaac_rl/isaac_rl/tasks/direct/isaac_rl/multigrasp_catalog.py"
+_catalog_spec = importlib.util.spec_from_file_location("_pdz_multigrasp_catalog", _CATALOG_MODULE_PATH)
 if _catalog_spec is None or _catalog_spec.loader is None:
     raise ImportError(f"Cannot load catalog validator from {_CATALOG_MODULE_PATH}.")
 _catalog_module = importlib.util.module_from_spec(_catalog_spec)
@@ -124,9 +119,7 @@ FILAMENT_FALLBACK_ENVIRONMENT_LIGHT_INTENSITY = 6500.0
 # instead of obscuring the parity in hard-coded MJCF half-size literals.
 CANONICAL_TSLOT_PITCH_M = 0.0255
 CANONICAL_TSLOT_LAND_WIDTH_M = 0.0205
-CANONICAL_TSLOT_SLOT_WIDTH_M = (
-    CANONICAL_TSLOT_PITCH_M - CANONICAL_TSLOT_LAND_WIDTH_M
-)
+CANONICAL_TSLOT_SLOT_WIDTH_M = CANONICAL_TSLOT_PITCH_M - CANONICAL_TSLOT_LAND_WIDTH_M
 CANONICAL_TSLOT_LAND_COUNT = 25
 CANONICAL_TSLOT_SURFACE_SIZE_M = (0.65, 0.60)
 
@@ -151,8 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--robot-urdf",
         type=Path,
-        default=REPO_ROOT
-        / "assets/urdf/kuka_iiwa7_pdz_gripper/urdf/kuka_iiwa7_pdz_gripper.urdf",
+        default=REPO_ROOT / "assets/urdf/kuka_iiwa7_pdz_gripper/urdf/kuka_iiwa7_pdz_gripper.urdf",
     )
     parser.add_argument("--renderer-backend", choices=("filament", "classic"), default="filament")
     parser.add_argument("--maximum-position-error-m", type=float, default=0.00005)
@@ -175,9 +167,7 @@ def parse_args() -> argparse.Namespace:
 
 def _atomic_savez(path: Path, payload: dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.stem}-", suffix=".npz", dir=path.parent
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".npz", dir=path.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
@@ -189,9 +179,7 @@ def _atomic_savez(path: Path, payload: dict[str, np.ndarray]) -> None:
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.stem}-", suffix=".json", dir=path.parent
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".json", dir=path.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
@@ -201,14 +189,10 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _select_targets(
-    payload: dict[str, np.ndarray], indices: np.ndarray
-) -> dict[str, np.ndarray]:
+def _select_targets(payload: dict[str, np.ndarray], indices: np.ndarray) -> dict[str, np.ndarray]:
     source_count = len(payload["target_ids"])
     return {
-        name: value[indices].copy()
-        if value.ndim > 0 and value.shape[0] == source_count
-        else value.copy()
+        name: value[indices].copy() if value.ndim > 0 and value.shape[0] == source_count else value.copy()
         for name, value in payload.items()
     }
 
@@ -220,28 +204,20 @@ def _ros_camera_quat_to_opengl(quat_wxyz: np.ndarray) -> np.ndarray:
     return quat_xyzw[[3, 0, 1, 2]]
 
 
-def _write_contact_sheet(
-    *, path: Path, rgb: np.ndarray, target_ids: np.ndarray
-) -> None:
+def _write_contact_sheet(*, path: Path, rgb: np.ndarray, target_ids: np.ndarray) -> None:
     columns = min(5, len(rgb))
     tile_width, tile_height, label_height = 384, 216, 30
     rows = int(math.ceil(len(rgb) / columns))
-    sheet = Image.new(
-        "RGB", (columns * tile_width, rows * (tile_height + label_height)), (20, 23, 28)
-    )
+    sheet = Image.new("RGB", (columns * tile_width, rows * (tile_height + label_height)), (20, 23, 28))
     draw = ImageDraw.Draw(sheet)
     try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15
-        )
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
     except OSError:
         font = ImageFont.load_default()
     for index, image in enumerate(rgb):
         column, row = index % columns, index // columns
         x, y = column * tile_width, row * (tile_height + label_height)
-        tile = Image.fromarray(image).resize(
-            (tile_width, tile_height), Image.Resampling.LANCZOS
-        )
+        tile = Image.fromarray(image).resize((tile_width, tile_height), Image.Resampling.LANCZOS)
         sheet.paste(tile, (x, y))
         draw.text(
             (x + 7, y + tile_height + 6),
@@ -256,11 +232,7 @@ def _write_contact_sheet(
 def _build_bundle_mesh(part: dict[str, object], output: Path) -> None:
     bundle_path = Path(str(part["source_current_stage2_bundle"])).expanduser()
     if not bundle_path.is_file():
-        bundle_path = (
-            REPO_ROOT
-            / "isaac_rl/data/plumbers_block/sources"
-            / f"part_{part['part_id']}_stage2.json"
-        )
+        bundle_path = REPO_ROOT / "isaac_rl/data/plumbers_block/sources" / f"part_{part['part_id']}_stage2.json"
     mesh = build_bundle_local_mesh(load_grasp_bundle(bundle_path))
     trimesh.Trimesh(
         vertices=np.asarray(mesh.vertices_obj, dtype=np.float64),
@@ -300,10 +272,7 @@ def _author_canonical_tslot_surface(worldbody: ET.Element) -> None:
         "geom",
         name="tslot_backing",
         type="box",
-        size=(
-            f"{0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[0]:.12g} "
-            f"{0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[1]:.12g} 0.002"
-        ),
+        size=(f"{0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[0]:.12g} {0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[1]:.12g} 0.002"),
         pos=f"{center_x:.12g} {center_y:.12g} -0.009",
         material="tslot_slot",
         contype="0",
@@ -316,10 +285,7 @@ def _author_canonical_tslot_surface(worldbody: ET.Element) -> None:
             "geom",
             name=f"tslot_land_{index:02d}",
             type="box",
-            size=(
-                f"{0.5 * CANONICAL_TSLOT_LAND_WIDTH_M:.12g} "
-                f"{0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[1]:.12g} 0.0015"
-            ),
+            size=(f"{0.5 * CANONICAL_TSLOT_LAND_WIDTH_M:.12g} {0.5 * CANONICAL_TSLOT_SURFACE_SIZE_M[1]:.12g} 0.0015"),
             pos=f"{x:.12g} {center_y:.12g} -0.003",
             material="tslot_aluminum",
             contype="0",
@@ -373,9 +339,7 @@ def _restore_pdz_gripper_visual_meshes(
     if asset is None or worldbody is None:
         raise RuntimeError("Canonical robot MJCF has no asset or worldbody element.")
     visual_mesh_dir = robot_urdf.parent.parent / "meshes" / "visual"
-    for body_name, geom_name, imported_mesh, visual_mesh, filename in (
-        _PDZ_GRIPPER_VISUAL_MESHES
-    ):
+    for body_name, geom_name, imported_mesh, visual_mesh, filename in _PDZ_GRIPPER_VISUAL_MESHES:
         mesh_path = (visual_mesh_dir / filename).resolve()
         if not mesh_path.is_file():
             raise FileNotFoundError(f"PDZ gripper visual mesh not found: {mesh_path}")
@@ -400,8 +364,7 @@ def _restore_pdz_gripper_visual_meshes(
         ]
         if len(matching_geoms) != 1:
             raise RuntimeError(
-                f"Expected one imported {body_name}/{geom_name or imported_mesh} geom, "
-                f"found {len(matching_geoms)}."
+                f"Expected one imported {body_name}/{geom_name or imported_mesh} geom, found {len(matching_geoms)}."
             )
         matching_geoms[0].set("mesh", visual_mesh)
 
@@ -443,9 +406,7 @@ def _scene_model(robot_mjcf: Path, robot_urdf: Path, part_mesh: Path) -> mujoco.
         raise RuntimeError("Canonical robot MJCF has no link7 body.")
     camera_cfg = D405WristCameraConfig(enabled=True)
     camera_position, camera_quat_ros = camera_pose_in_link7(camera_cfg)
-    camera_quat_gl = _ros_camera_quat_to_opengl(
-        np.asarray(camera_quat_ros, dtype=np.float64)
-    )
+    camera_quat_gl = _ros_camera_quat_to_opengl(np.asarray(camera_quat_ros, dtype=np.float64))
     scale_x = WIDTH / float(camera_cfg.width)
     scale_y = HEIGHT / float(camera_cfg.height)
     for old_camera in link7_xml.findall("camera[@name='d405']"):
@@ -458,13 +419,8 @@ def _scene_model(robot_mjcf: Path, robot_urdf: Path, part_mesh: Path) -> mujoco.
         quat=" ".join(f"{value:.12g}" for value in camera_quat_gl),
         resolution=f"{WIDTH} {HEIGHT}",
         sensorsize=f"{WIDTH} {HEIGHT}",
-        focalpixel=(
-            f"{camera_cfg.fx * scale_x:.12g} {camera_cfg.fy * scale_y:.12g}"
-        ),
-        principalpixel=(
-            f"{camera_cfg.cx * scale_x - WIDTH / 2.0:.12g} "
-            f"{HEIGHT / 2.0 - camera_cfg.cy * scale_y:.12g}"
-        ),
+        focalpixel=(f"{camera_cfg.fx * scale_x:.12g} {camera_cfg.fy * scale_y:.12g}"),
+        principalpixel=(f"{camera_cfg.cx * scale_x - WIDTH / 2.0:.12g} {HEIGHT / 2.0 - camera_cfg.cy * scale_y:.12g}"),
     )
     compiler = root.find("compiler")
     if compiler is None:
@@ -492,9 +448,7 @@ def _scene_model(robot_mjcf: Path, robot_urdf: Path, part_mesh: Path) -> mujoco.
             link7_xml.remove(geom)
             removed_base = True
     if not (removed_box and removed_base):
-        raise RuntimeError(
-            "Could not remove the camera enclosure surfaces that contain the optical origin."
-        )
+        raise RuntimeError("Could not remove the camera enclosure surfaces that contain the optical origin.")
     _restore_pdz_gripper_visual_meshes(root, robot_urdf)
     for finger_name in (
         "pdz_gripper_left_finger_link",
@@ -524,17 +478,14 @@ def _scene_model(robot_mjcf: Path, robot_urdf: Path, part_mesh: Path) -> mujoco.
     model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
     if model.nlight != 0:
         raise RuntimeError(
-            "The canonical Filament scene must have no physical lights so its "
-            "environment illumination remains active."
+            "The canonical Filament scene must have no physical lights so its environment illumination remains active."
         )
     return model
 
 
 def _apply_filament_materials(model: mujoco.MjModel) -> None:
     for name, material in GOAL_FILAMENT_MATERIALS.items():
-        material_id = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_MATERIAL, name
-        )
+        material_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, name)
         if material_id < 0:
             raise RuntimeError(f"MuJoCo material '{name}' was not compiled.")
         model.mat_rgba[material_id, :3] = material.color
@@ -569,9 +520,7 @@ def _tcp_pose(
 
 def main() -> None:  # noqa: C901
     args = parse_args()
-    if args.renderer_backend == MUJOCO_GOAL_RENDERER_BACKEND and os.environ.get(
-        "MUJOCO_FILAMENT_ACTIVE"
-    ) != "1":
+    if args.renderer_backend == MUJOCO_GOAL_RENDERER_BACKEND and os.environ.get("MUJOCO_FILAMENT_ACTIVE") != "1":
         raise RuntimeError(
             "Filament catalog capture must be launched through "
             "scripts/run_mujoco_filament.sh so LD_PRELOAD is active before Python starts."
@@ -611,9 +560,7 @@ def main() -> None:  # noqa: C901
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     part_records = list(manifest["parts"])
     urdf_root = ET.parse(robot_urdf).getroot()
-    tcp_position_link7, tcp_rotation_link7, _tcp_link = _robot_tcp_transform_link7(
-        urdf_root
-    )
+    tcp_position_link7, tcp_rotation_link7, _tcp_link = _robot_tcp_transform_link7(urdf_root)
     rgb = np.empty((target_count, HEIGHT, WIDTH, 3), dtype=np.uint8)
     depth = np.empty((target_count, HEIGHT, WIDTH), dtype=np.float32)
     position_errors = np.empty(target_count, dtype=np.float32)
@@ -636,25 +583,16 @@ def main() -> None:  # noqa: C901
             _build_bundle_mesh(part, part_mesh)
             model = _scene_model(robot_mjcf, robot_urdf, part_mesh)
             _apply_filament_materials(model)
-            part_material_id = mujoco.mj_name2id(
-                model, mujoco.mjtObj.mjOBJ_MATERIAL, "part_canonical"
-            )
+            part_material_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "part_canonical")
             if part_material_id < 0:
                 raise RuntimeError("MuJoCo material 'part_canonical' was not compiled.")
             data = mujoco.MjData(model)
             renderer = mujoco.Renderer(model, height=HEIGHT, width=WIDTH)
             try:
                 for completed, target_index in enumerate(selected.tolist(), start=1):
-                    data.qpos[:7] = (
-                        payload["reset_joint_trajectories"][target_index, -1]
-                        * MOVEIT_TO_ISAAC_SIGNS
-                    )
+                    data.qpos[:7] = payload["reset_joint_trajectories"][target_index, -1] * MOVEIT_TO_ISAAC_SIGNS
                     finger_travel = np.clip(
-                        0.5
-                        * (
-                            float(payload["approach_gripper_widths_m"][target_index])
-                            - PDZ_GRIPPER_CLOSED_WIDTH_M
-                        ),
+                        0.5 * (float(payload["approach_gripper_widths_m"][target_index]) - PDZ_GRIPPER_CLOSED_WIDTH_M),
                         0.0,
                         PDZ_GRIPPER_TRAVEL_M,
                     )
@@ -673,22 +611,16 @@ def main() -> None:  # noqa: C901
                     desired_rotation = Rotation.from_quat(
                         payload["goal_tcp_orientations_xyzw_w"][target_index]
                     ).as_matrix()
-                    position_errors[target_index] = np.linalg.norm(
-                        desired_position - actual_position
-                    )
+                    position_errors[target_index] = np.linalg.norm(desired_position - actual_position)
                     rotation_errors[target_index] = np.linalg.norm(
-                        Rotation.from_matrix(
-                            desired_rotation @ actual_rotation.T
-                        ).as_rotvec()
+                        Rotation.from_matrix(desired_rotation @ actual_rotation.T).as_rotvec()
                     )
                     renderer.update_scene(data, camera="d405")
                     rgb[target_index] = renderer.render()
                     if goal_rgb_policy_variants is not None:
                         canonical_color = model.mat_rgba[part_material_id, :3].copy()
                         for variant_slot, palette_index in enumerate(goal_palette_indices):
-                            model.mat_rgba[part_material_id, :3] = VISUAL_SERVO_PART_PALETTE[
-                                palette_index
-                            ].color
+                            model.mat_rgba[part_material_id, :3] = VISUAL_SERVO_PART_PALETTE[palette_index].color
                             renderer.update_scene(data, camera="d405")
                             goal_rgb_policy_variants[target_index, variant_slot] = _policy_area_downsample(
                                 renderer.render()
@@ -786,8 +718,7 @@ def main() -> None:  # noqa: C901
         diagnostic = output.with_name(f"{output.stem}_failed_validation.npz")
         _atomic_savez(diagnostic, payload)
         raise RuntimeError(
-            f"Rejected {int(failure.sum())}/{target_count} MuJoCo goal renders; "
-            f"diagnostics are in {diagnostic}."
+            f"Rejected {int(failure.sum())}/{target_count} MuJoCo goal renders; diagnostics are in {diagnostic}."
         )
     _atomic_savez(output, payload)
     load_multigrasp_catalog(output, expected_arm_joint_count=7, require_complete=True)

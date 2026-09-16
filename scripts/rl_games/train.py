@@ -164,15 +164,12 @@ def _wait_for_distributed_environment_barrier(global_rank: int, world_size: int)
         return
     barrier_path_value = os.getenv("ISAAC_RL_DISTRIBUTED_READY_DIR")
     if not barrier_path_value:
-        raise RuntimeError(
-            "Distributed Isaac startup requires ISAAC_RL_DISTRIBUTED_READY_DIR."
-        )
+        raise RuntimeError("Distributed Isaac startup requires ISAAC_RL_DISTRIBUTED_READY_DIR.")
     barrier_path = Path(barrier_path_value)
     barrier_path.mkdir(parents=True, exist_ok=True)
     (barrier_path / f"rank_{global_rank}.ready").write_text("ready\n", encoding="utf-8")
     print(
-        f"[EULER_DISTRIBUTED] rank {global_rank}/{world_size} waiting at environment barrier: "
-        f"{barrier_path}",
+        f"[EULER_DISTRIBUTED] rank {global_rank}/{world_size} waiting at environment barrier: {barrier_path}",
         flush=True,
     )
     deadline = time.monotonic() + 30.0 * 60.0
@@ -186,8 +183,7 @@ def _wait_for_distributed_environment_barrier(global_rank: int, world_size: int)
             return
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"Timed out waiting for distributed environments: {ready_count}/{world_size} ready at "
-                f"{barrier_path}."
+                f"Timed out waiting for distributed environments: {ready_count}/{world_size} ready at {barrier_path}."
             )
         time.sleep(1.0)
 
@@ -513,9 +509,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     rollout_batch_size = env.unwrapped.num_envs * train_cfg["horizon_length"]
     global_rollout_batch_size = rollout_batch_size * world_size
     target_global_minibatch_size = (
-        args_cli.global_minibatch_size
-        if args_cli.global_minibatch_size is not None
-        else train_cfg["minibatch_size"]
+        args_cli.global_minibatch_size if args_cli.global_minibatch_size is not None else train_cfg["minibatch_size"]
     )
     minibatch_size = resolve_local_minibatch_size(
         rollout_batch_size_per_rank=rollout_batch_size,
@@ -523,9 +517,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         world_size=world_size,
     )
     effective_global_minibatch_size = minibatch_size * world_size
-    optimizer_updates_per_epoch = (
-        rollout_batch_size // minibatch_size * int(train_cfg["mini_epochs"])
-    )
+    optimizer_updates_per_epoch = rollout_batch_size // minibatch_size * int(train_cfg["mini_epochs"])
     train_cfg["minibatch_size"] = minibatch_size
     if "central_value_config" in train_cfg:
         train_cfg["central_value_config"]["minibatch_size"] = minibatch_size
