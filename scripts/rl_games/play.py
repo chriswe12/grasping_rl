@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -25,6 +26,8 @@ parser.add_argument(
     "--agent", type=str, default="rl_games_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
+parser.add_argument("--dataset-index", type=Path, default=None)
+parser.add_argument("--dataset-shard", type=int, default=None)
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
     "--reset_progress",
@@ -109,7 +112,6 @@ import math
 import os
 import random
 import time
-from pathlib import Path
 
 import gymnasium as gym
 import torch
@@ -135,6 +137,12 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaac_rl.tasks  # noqa: F401
+from grasp_planning.rl.fabrica_dataset import (
+    DEFAULT_DATASET_INDEX,
+    FABRICA_PLAY_TASK_ID,
+    FABRICA_TASK_ID,
+    configure_fabrica_env_cfg,
+)
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (
     register_grasp_completion_runner,
 )
@@ -336,6 +344,18 @@ def main(  # noqa: C901 - Isaac Lab playback setup and lifecycle
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
+
+    if args_cli.task in (FABRICA_TASK_ID, FABRICA_PLAY_TASK_ID):
+        shard = configure_fabrica_env_cfg(
+            env_cfg,
+            explicit_shard=args_cli.dataset_shard,
+            index_path=args_cli.dataset_index or DEFAULT_DATASET_INDEX,
+        )
+        print(
+            f"[INFO] Fabrica dataset shard={shard.shard_index}/{shard.shard_count} "
+            f"targets={shard.target_count} parts={len(shard.part_names)}",
+            flush=True,
+        )
 
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs

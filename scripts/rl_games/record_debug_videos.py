@@ -21,6 +21,13 @@ parser.add_argument(
 )
 parser.add_argument("--agent", default="rl_games_cfg_entry_point")
 parser.add_argument("--checkpoint", required=True)
+parser.add_argument("--dataset-index", type=Path, default=None)
+parser.add_argument("--dataset-shard", type=int, default=None)
+parser.add_argument(
+    "--dataset-merged",
+    action="store_true",
+    help="Draw video targets from the complete merged Fabrica catalog instead of one training shard.",
+)
 parser.add_argument("--output_dir", default="artifacts/rl_policy_debug_videos")
 parser.add_argument("--episode_seconds", type=float, default=15.0)
 parser.add_argument("--fps", type=float, default=15.0)
@@ -89,6 +96,12 @@ import torch  # noqa: E402
 from grasp_planning.d405_wrist_camera import (  # noqa: E402
     VISUAL_SERVO_OBSERVATION_HEIGHT,
     VISUAL_SERVO_OBSERVATION_WIDTH,
+)
+from grasp_planning.rl.fabrica_dataset import (  # noqa: E402
+    DEFAULT_DATASET_INDEX,
+    FABRICA_PLAY_TASK_ID,
+    FABRICA_TASK_ID,
+    configure_fabrica_env_cfg,
 )
 from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context  # noqa: E402
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile  # noqa: E402
@@ -321,7 +334,7 @@ def _compose_frame(
         (f"policy p(done) {sample.completion_probability:7.4f}", (255, 194, 102)),
         (f"final     {final_position_mm:8.3f} mm   {final_rotation_deg:7.3f} deg", (124, 232, 159)),
         (f"best      {best_position_mm:8.3f} mm   {best_rotation_deg:7.3f} deg", (202, 171, 255)),
-        ("strict ready: position <= 4 mm AND rotation <= 3 deg", (255, 194, 102)),
+        ("strict: <=4 mm / <=3 deg    operational: <=7 mm / <=5 deg", (255, 194, 102)),
     ]
     for line_index, (text, color) in enumerate(lines):
         draw.text((40, 634 + line_index * 27), text, font=_font(16), fill=color)
@@ -349,6 +362,18 @@ def main(env_cfg, agent_cfg: dict) -> None:
         raise ValueError("Episode duration and FPS must be positive.")
     if args_cli.target_indices is not None and len(args_cli.target_indices) != len(args_cli.conditions):
         raise ValueError("--target_indices must provide exactly one index per condition.")
+    if args_cli.task in (FABRICA_TASK_ID, FABRICA_PLAY_TASK_ID):
+        shard = configure_fabrica_env_cfg(
+            env_cfg,
+            explicit_shard=args_cli.dataset_shard,
+            merged=args_cli.dataset_merged,
+            index_path=args_cli.dataset_index or DEFAULT_DATASET_INDEX,
+        )
+        print(
+            f"[INFO] Fabrica dataset shard={shard.shard_index}/{shard.shard_count} "
+            f"targets={shard.target_count} parts={len(shard.part_names)}",
+            flush=True,
+        )
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.seed = args_cli.seed
@@ -491,8 +516,10 @@ def main(env_cfg, agent_cfg: dict) -> None:
             obs, _, dones, _ = env.step(actions)
             if bool(torch.as_tensor(dones).any().item()):
                 evaluation = task_env.extras.get("evaluation", {})
-                if bool(torch.as_tensor(evaluation.get("success", False)).any().item()):
-                    termination = "policy_declared_success"
+                if bool(torch.as_tensor(evaluation.get("strict_success", False)).any().item()):
+                    termination = "policy_declared_strict_success"
+                elif bool(torch.as_tensor(evaluation.get("operational_success", False)).any().item()):
+                    termination = "policy_declared_operational_success"
                 elif bool(torch.as_tensor(evaluation.get("premature_completion", False)).any().item()):
                     termination = "policy_declared_prematurely"
                 elif bool(torch.as_tensor(evaluation.get("collision", False)).any().item()):

@@ -17,6 +17,7 @@ from grasp_planning.d405_wrist_camera import (
 )
 from grasp_planning.envs.fr3_part_env import make_fr3_part_scene_cfg
 from grasp_planning.isaac_visual_scene import make_visual_servo_render_cfg
+from grasp_planning.rl.fabrica_dataset import configure_fabrica_env_cfg
 from grasp_planning.rl.policy_context import POLICY_CONTEXT_ACTION
 from grasp_planning.rl.policy_timing import PHYSICS_RATE_HZ, POLICY_DECIMATION
 
@@ -254,7 +255,7 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     live_depth_noise_std_m = (0.0, 0.0002)
     # Provisional documented D405/D400 profile. Device-specific plane captures
     # will replace these ranges without changing the observation contract.
-    sim2real_randomization_profile = "d405_documented_provisional_v6_15hz:combined_sim2real"
+    sim2real_randomization_profile = "d405_documented_provisional_v7_15hz:combined_sim2real"
     live_correlated_depth_enabled = True
     live_stereo_focal_length_px = _camera_cfg.fx
     live_stereo_baseline_m = _camera_cfg.stereo_baseline_m
@@ -271,6 +272,8 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     live_depth_edge_threshold_m = 0.008
     live_rgb_patch_occlusion_probability = 0.06
     live_depth_patch_dropout_probability = 0.04
+    live_depth_structured_dropout_probability = 0.08
+    live_depth_structured_dropout_seed_probability = (0.001, 0.006)
     live_patch_area_fraction = (0.005, 0.03)
     live_calibration_warp_enabled = True
     live_calibration_shift_x_px = (-1.5, 1.5)
@@ -300,8 +303,16 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     # collision surface remains the unchanged flat z=0 plane.
     scene_tslot_surface_enabled = True
     scene_tslot_geometry_randomization_enabled = True
-    scene_tslot_nominal_fraction = 0.60
-    scene_tslot_phase_fraction = 0.20
+    scene_tslot_nominal_fraction = 0.0
+    scene_tslot_phase_fraction = 0.0
+    # Render/depth-only tape, partial writing, dirt, and scratches. Markings
+    # are kept outside the nominal grasp corridor and never affect collision.
+    scene_surface_markings_enabled = True
+    scene_surface_markings_environment_fraction = 0.75
+    scene_surface_markings_clean_fraction = 0.20
+    scene_surface_markings_min_count = 2
+    scene_surface_markings_max_count = 6
+    scene_surface_markings_target_clearance_radius_m = 0.075
     # Optional render/depth-only peripheral props. They deliberately carry no
     # collision schema and sit outside the nominal target/approach corridor;
     # PhysX continues to use the same flat z=0 workspace plane.
@@ -326,11 +337,26 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     scene_part_saturation_scale = (0.90, 1.10)
     scene_part_hue_shift_deg = (-5.0, 5.0)
     scene_part_roughness = (0.65, 0.90)
+    scene_part_metallic = (0.0, 0.18)
+    # Optional true-rendered goal variants. If the catalog lacks them the
+    # environment reports a warning and keeps independent live colors.
+    goal_live_color_relationship_enabled = False
+    goal_live_color_relationship_required = False
+    goal_live_color_match_fraction = 0.25
+    goal_live_color_similar_fraction = 0.20
     scene_tslot_color_scale = (0.88, 1.12)
     scene_tslot_saturation_scale = (0.90, 1.10)
     scene_tslot_hue_shift_deg = (-5.0, 5.0)
     scene_tslot_roughness_delta = (-0.08, 0.08)
-    scene_finger_color_scale = (0.80, 1.20)
+    # Scaling must be relatively wide to be visible on near-black albedo, but
+    # even the upper bound remains black. One fifth stays exactly canonical.
+    scene_gripper_canonical_fraction = 0.20
+    scene_finger_color_scale = (0.50, 2.00)
+    scene_finger_hue_shift_deg = (-6.0, 6.0)
+    scene_finger_roughness = (0.30, 0.70)
+    scene_pad_color_scale = (0.88, 1.06)
+    scene_pad_temperature_shift = (-0.03, 0.03)
+    scene_pad_roughness = (0.55, 0.88)
     scene_ground_color_scale = (0.75, 1.25)
     scene_ground_hue_shift_deg = (-12.0, 12.0)
     scene_ground_roughness = (0.75, 1.0)
@@ -339,13 +365,17 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     # Preserve the former 7.5 normalized-units/s slew limit at 15 Hz.
     action_delta_limit = 0.50
     dls_damping = 0.08
-    # Privileged completion ground truth is used only for training and
-    # evaluation. The strict positive and clear negative thresholds leave an
-    # ignored ambiguity band, preventing contradictory labels near the edge.
-    completion_ready_position_m = 0.004
-    completion_ready_rotation_rad = 3.0 * 3.141592653589793 / 180.0
-    completion_negative_position_m = 0.006
-    completion_negative_rotation_rad = 4.0 * 3.141592653589793 / 180.0
+    # Strict accuracy remains a reporting-only benchmark. Training completion
+    # instead asks whether the pose is operationally safe to hold and close;
+    # being slightly outside the strict box must not become a catastrophic
+    # false-stop label. These global operational tolerances are deliberately
+    # conservative until per-grasp close-and-lift envelopes are available.
+    strict_success_position_m = 0.004
+    strict_success_rotation_rad = 3.0 * 3.141592653589793 / 180.0
+    completion_ready_position_m = 0.007
+    completion_ready_rotation_rad = 5.0 * 3.141592653589793 / 180.0
+    completion_negative_position_m = 0.012
+    completion_negative_rotation_rad = 10.0 * 3.141592653589793 / 180.0
     # Training and deployment use the same high-confidence, multi-frame,
     # low-speed gate. The auxiliary classifier supplies dense probability
     # supervision while PPO retains control of the actual stop decision.
@@ -365,13 +395,58 @@ class GraspVisualServoEnvCfg(DirectRLEnvCfg):
     rotation_precision_weight = 2.0
     rotation_precision_scale_rad = 0.12
     completion_correct_reward = 50.0
-    completion_positive_terminal_reward_scale = 0.20
-    completion_premature_penalty = 50.0
-    unsafe_collision_penalty = 50.0
-    timeout_penalty = 15.0
-    divergence_penalty = 25.0
+    completion_positive_terminal_reward_scale = 0.50
+    completion_premature_penalty = 30.0
+    unsafe_collision_penalty = 60.0
+    timeout_penalty = 20.0
+    missed_operational_timeout_penalty = 35.0
+    divergence_penalty = 30.0
     step_penalty = 0.02
     action_penalty_weight = 0.002
+    # Optional robust-reward terms. They are exactly disabled for legacy and
+    # no-reward-change profiles.
+    near_goal_action_penalty_weight = 0.0
+    action_delta_penalty_weight = 0.0
+    near_goal_regression_penalty_weight = 0.0
+    # Optional cost for exceeding the externally enforced safe-stop speeds
+    # near the goal. Slow corrective motion remains free.
+    near_goal_excess_speed_penalty_weight = 0.0
+    # Optional terminal close-and-lift option. Normal tasks leave parts
+    # kinematic and terminate immediately on completion as before. Lift-aware
+    # profiles switch the part to dynamic physics, hold it fixed until the
+    # scripted close finishes, and terminate only after measuring retention.
+    lift_reward_enabled = False
+    lift_reward_profile = "none"
+    lift_completion_negative_supervision_enabled = True
+    # Match the full-catalog validation protocol rather than shortening the
+    # physical test merely to increase PPO throughput.
+    lift_close_duration_s = 1.00
+    lift_gravity_release_duration_s = 0.15
+    lift_height_m = 0.060
+    lift_speed_m_s = 0.050
+    lift_hold_duration_s = 0.20
+    lift_squeeze_margin_m = 0.015
+    lift_maximum_joint_speed_rad_s = 1.0
+    lift_dls_damping = 0.05
+    lift_hand_effort_limit_n = 200.0
+    lift_hand_stiffness = 15_000.0
+    lift_hand_damping = 245.0
+    lift_static_friction = 10.0
+    lift_dynamic_friction = 10.0
+    # PPO uses a permissive pickup threshold and continuous quality. The
+    # standalone benchmark's stricter 40 mm criterion remains reporting-only.
+    lift_minimum_credit_m = 0.005
+    lift_full_credit_m = 0.040
+    lift_minimum_pickup_m = 0.025
+    lift_maximum_relative_drift_m = 0.030
+    lift_maximum_peak_drop_m = 0.015
+    lift_drift_scale_m = 0.015
+    lift_drop_scale_m = 0.010
+    lift_minimum_arm_fraction = 0.80
+    lift_commit_geometric_reward = 0.0
+    lift_quality_reward = 0.0
+    lift_geometric_lift_bonus = 0.0
+    lift_neither_penalty = 0.0
     auxiliary_position_scale_m = 0.10
     auxiliary_rotation_scale_rad = 0.35
 
@@ -446,6 +521,63 @@ class GraspVisualServoMultiPartEnvCfg(GraspVisualServoEnvCfg):
 @configclass
 class GraspVisualServoMultiPartEnvCfg_PLAY(GraspVisualServoMultiPartEnvCfg):
     """Held-out-test playback configuration for the multi-part policy."""
+
+    episode_length_s = 15.0
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=1.5, replicate_physics=True)
+    catalog_split = "test"
+    reset_progress_min = 0.0
+    reset_progress_max = 0.0
+    reset_joint_noise_far_rad = 0.0
+    reset_joint_noise_near_rad = 0.0
+    reset_rotation_fraction_min = 1.0
+    reset_rotation_fraction_max = 1.0
+    reset_position_fraction_min = 1.0
+    reset_position_fraction_max = 1.0
+    reset_object_yaw_fraction_min = 1.0
+    reset_object_yaw_fraction_max = 1.0
+    live_observation_randomization_enabled = False
+    scene_appearance_randomization_enabled = False
+    scene_tslot_geometry_randomization_enabled = False
+    scene_tslot_surface_enabled = True
+    live_observation_delay_max_steps = 0
+    live_observation_repeat_probability = 0.0
+    motion_action_delay_max_steps = 0
+    motion_action_two_step_probability = 0.0
+    motion_response_scale = (1.0, 1.0)
+    motion_response_alpha = (1.0, 1.0)
+    motion_bias = (0.0, 0.0)
+    physics_joint_stiffness_scale = (1.0, 1.0)
+    physics_joint_damping_scale = (1.0, 1.0)
+    completion_positive_reset_fraction = 0.0
+    training_reset_mixture_enabled = False
+    training_curriculum_enabled = False
+    variable_reset_timeouts_enabled = False
+    failure_replay_fraction = 0.0
+    completion_probability_threshold = 0.95
+    completion_required_consecutive_steps = 4
+    completion_max_linear_speed_m_s = 0.005
+    completion_max_angular_speed_rad_s = 0.03
+
+
+@configclass
+class GraspVisualServoFabricaAllEnvCfg(GraspVisualServoMultiPartEnvCfg):
+    """Part-sharded training configuration for the validated Fabrica-all data."""
+
+    dataset_name = "fabrica_all_v1"
+    dataset_sha256 = ""
+    dataset_shard_index = 0
+    dataset_shard_count = 4
+
+    def __post_init__(self) -> None:
+        # A direct gym/Isaac consumer gets a valid single-GPU shard by default.
+        # Distributed entrypoints replace this with the rank-matched shard
+        # before the environment is constructed.
+        configure_fabrica_env_cfg(self, rank=0, world_size=1)
+
+
+@configclass
+class GraspVisualServoFabricaAllEnvCfg_PLAY(GraspVisualServoFabricaAllEnvCfg):
+    """Held-out-test playback configuration for one Fabrica-all shard."""
 
     episode_length_s = 15.0
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=1.5, replicate_physics=True)

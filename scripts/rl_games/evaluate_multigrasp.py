@@ -33,6 +33,13 @@ parser.add_argument(
     help="RL-Games configuration entry point.",
 )
 parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint to evaluate.")
+parser.add_argument("--dataset-index", type=Path, default=None)
+parser.add_argument("--dataset-shard", type=int, default=None)
+parser.add_argument(
+    "--dataset-merged",
+    action="store_true",
+    help="Evaluate the complete merged Fabrica catalog instead of one distributed-training shard.",
+)
 parser.add_argument(
     "--controller",
     choices=("policy", "blind_nominal"),
@@ -143,6 +150,12 @@ from grasp_planning.d405_wrist_camera import (  # noqa: E402
     VISUAL_SERVO_OBSERVATION_WIDTH,
 )
 from grasp_planning.rl.completion_diagnostics import CompletionDiagnostics  # noqa: E402
+from grasp_planning.rl.fabrica_dataset import (  # noqa: E402
+    DEFAULT_DATASET_INDEX,
+    FABRICA_PLAY_TASK_ID,
+    FABRICA_TASK_ID,
+    configure_fabrica_env_cfg,
+)
 from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context  # noqa: E402
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile  # noqa: E402
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (  # noqa: E402
@@ -173,12 +186,15 @@ def _cpu(value: torch.Tensor) -> torch.Tensor:
 
 def _summarize(rows: list[dict[str, object]]) -> dict[str, object]:
     successes = sum(bool(row["success"]) for row in rows)
+    operational_successes = sum(bool(row.get("operational_success", row["success"])) for row in rows)
     terminations = Counter(str(row["termination"]) for row in rows)
     attempts = len(rows)
     return {
         "attempts": attempts,
         "successes": successes,
         "success_rate": successes / attempts if rows else 0.0,
+        "operational_successes": operational_successes,
+        "operational_success_rate": operational_successes / attempts if rows else 0.0,
         "terminations": dict(sorted(terminations.items())),
         "termination_rates": {name: count / attempts for name, count in sorted(terminations.items())},
         "initial_position_error_mm_mean": mean(float(row["initial_position_error_mm"]) for row in rows),
@@ -295,10 +311,10 @@ def _build_report(
         f"Each attempt had up to {episode_seconds:.1f} s.",
         "",
         (
-            "| Condition | Progress | Position offset | Object yaw | Rotation cmd. | Attempts | Success "
+            "| Condition | Progress | Position offset | Object yaw | Rotation cmd. | Attempts | Strict | Operational "
             "| Initial pos. | Initial rot. | Final pos. | Final rot. |"
         ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for condition, metrics in conditions.items():
         lines.append(
@@ -307,6 +323,7 @@ def _build_report(
             f"| {metrics['reset_object_yaw_deg_mean']:.2f} deg "
             f"| {metrics['reset_rotation_command_deg_mean']:.2f} deg "
             f"| {metrics['attempts']} | {100.0 * metrics['success_rate']:.1f}% "
+            f"| {100.0 * metrics['operational_success_rate']:.1f}% "
             f"| {metrics['initial_position_error_mm_mean']:.2f} mm "
             f"| {metrics['initial_rotation_error_deg_mean']:.2f} deg "
             f"| {metrics['final_position_error_mm_mean']:.2f} mm "
@@ -318,7 +335,7 @@ def _build_report(
             "## Completion-head diagnostics",
             "",
             (
-                "These per-step metrics use only unambiguous privileged labels during evaluation. "
+                "These per-step metrics use the operational geometric completion labels during evaluation. "
                 "Precision and recall apply the raw probability threshold before the four-frame deployment hold."
             ),
             "",
@@ -346,14 +363,15 @@ def _build_report(
             "",
             "## Per part",
             "",
-            "| Condition | Part | Success | Final pos. | Final rot. |",
-            "|---|---|---:|---:|---:|",
+            "| Condition | Part | Strict | Operational | Final pos. | Final rot. |",
+            "|---|---|---:|---:|---:|---:|",
         ]
     )
     for (condition, part_id), group in sorted(by_part.items()):
         metrics = _summarize(group)
         lines.append(
             f"| {condition} | {part_id} | {100.0 * metrics['success_rate']:.1f}% "
+            f"| {100.0 * metrics['operational_success_rate']:.1f}% "
             f"| {metrics['final_position_error_mm_mean']:.2f} mm "
             f"| {metrics['final_rotation_error_deg_mean']:.2f} deg |"
         )
@@ -362,14 +380,15 @@ def _build_report(
             "",
             "## Per orientation",
             "",
-            "| Condition | Orientation | Success | Final pos. | Final rot. |",
-            "|---|---|---:|---:|---:|",
+            "| Condition | Orientation | Strict | Operational | Final pos. | Final rot. |",
+            "|---|---|---:|---:|---:|---:|",
         ]
     )
     for (condition, orientation), group in sorted(by_orientation.items()):
         metrics = _summarize(group)
         lines.append(
             f"| {condition} | {orientation} | {100.0 * metrics['success_rate']:.1f}% "
+            f"| {100.0 * metrics['operational_success_rate']:.1f}% "
             f"| {metrics['final_position_error_mm_mean']:.2f} mm "
             f"| {metrics['final_rotation_error_deg_mean']:.2f} deg |"
         )
@@ -385,6 +404,27 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
         raise ValueError("--runs_per_target must be at least one.")
     if args_cli.episode_seconds <= 0.0:
         raise ValueError("--episode_seconds must be positive.")
+    if args_cli.task in (FABRICA_TASK_ID, FABRICA_PLAY_TASK_ID):
+        shard = configure_fabrica_env_cfg(
+            env_cfg,
+            explicit_shard=args_cli.dataset_shard,
+            merged=args_cli.dataset_merged,
+            index_path=args_cli.dataset_index or DEFAULT_DATASET_INDEX,
+        )
+        print(
+            f"[INFO] Fabrica dataset shard={shard.shard_index}/{shard.shard_count} "
+            f"targets={shard.target_count} parts={len(shard.part_names)}",
+            flush=True,
+        )
+        if args_cli.dataset_merged:
+            # The merged evaluation scene contains every part variant in every
+            # environment. Keep PhysX broad-phase collisions reliable at the
+            # full 137-target validation batch instead of accepting its
+            # "simulation will miss interactions" warning.
+            env_cfg.sim.physx.gpu_found_lost_pairs_capacity = max(
+                int(env_cfg.sim.physx.gpu_found_lost_pairs_capacity),
+                2**23,
+            )
     sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
     context_spec = resolve_policy_context(args_cli.policy_context)
     env_cfg.policy_context_mode = context_spec.name
@@ -596,20 +636,23 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                 )
                 newly_done = active & done_cpu
                 if newly_done.any():
-                    success = _cpu(evaluation["success"]).bool()
+                    strict_success = _cpu(evaluation["strict_success"]).bool()
+                    operational_success = _cpu(evaluation["operational_success"]).bool()
                     premature = _cpu(evaluation["premature_completion"]).bool()
                     collision = _cpu(evaluation["collision"]).bool()
                     diverged = _cpu(evaluation["diverged"]).bool()
                     timed_out = _cpu(evaluation["timed_out"]).bool()
                     for env_index in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
-                        if bool(success[env_index]):
+                        if bool(strict_success[env_index]):
                             termination[env_index] = "success"
-                        elif bool(premature[env_index]):
-                            termination[env_index] = "premature_completion"
+                        elif bool(operational_success[env_index]):
+                            termination[env_index] = "operational_success"
                         elif bool(collision[env_index]):
                             termination[env_index] = "unsafe_collision"
                         elif bool(diverged[env_index]):
                             termination[env_index] = "diverged"
+                        elif bool(premature[env_index]):
+                            termination[env_index] = "premature_completion"
                         elif bool(timed_out[env_index]):
                             termination[env_index] = "timeout"
                         else:
@@ -637,6 +680,7 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                         "part_id": task_env.part_names[part_index],
                         "termination": termination[env_index],
                         "success": termination[env_index] == "success",
+                        "operational_success": termination[env_index] in ("success", "operational_success"),
                         "steps": int(terminal_steps[env_index]),
                         "duration_s": float(terminal_steps[env_index]) * task_env.step_dt,
                         "reset_progress": float(reset_progress[env_index]),
@@ -664,7 +708,8 @@ def main(  # noqa: C901 - batched evaluation setup, rollout, and reporting
                 f"position_offset={completed['reset_position_offset_mm_mean']:.2f} mm "
                 f"object_yaw={completed['reset_object_yaw_deg_mean']:.2f} deg "
                 f"repeat={repeat + 1}/{args_cli.runs_per_target} "
-                f"success={100.0 * completed['success_rate']:.1f}% "
+                f"strict={100.0 * completed['success_rate']:.1f}% "
+                f"operational={100.0 * completed['operational_success_rate']:.1f}% "
                 f"final={completed['final_position_error_mm_mean']:.2f} mm / "
                 f"{completed['final_rotation_error_deg_mean']:.2f} deg",
                 flush=True,

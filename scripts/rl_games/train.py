@@ -8,7 +8,9 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import fcntl
 import math
+import os
 import sys
 from distutils.util import strtobool
 from pathlib import Path
@@ -38,6 +40,18 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--dataset-index",
+    type=Path,
+    default=None,
+    help="Override the portable Fabrica-all dataset index (advanced/debug use).",
+)
+parser.add_argument(
+    "--dataset-shard",
+    type=int,
+    default=None,
+    help="Use one explicit Fabrica-all shard for a single-GPU probe.",
+)
 parser.add_argument(
     "--experiment-name",
     type=str,
@@ -79,6 +93,19 @@ parser.add_argument(
         "or additionally add the continuous 6D base-from-camera orientation."
     ),
 )
+parser.add_argument(
+    "--training-profile",
+    choices=(
+        "baseline",
+        "long_run_improved",
+        "robust_no_reward_change",
+        "robust_reward_change",
+        "lift_conservative",
+        "lift_primary",
+    ),
+    default="baseline",
+    help="Named PPO/critic/reset profile recorded with this training run.",
+)
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
 parser.add_argument("--wandb-name", type=str, default=None, help="the name of wandb's run")
@@ -102,18 +129,87 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
 
+
+def _acquire_distributed_startup_lock():
+    """Serialize Isaac application and environment startup across local ranks."""
+    lock_path_value = os.getenv("ISAAC_RL_STARTUP_LOCK")
+    if not lock_path_value:
+        return None
+    lock_path = Path(lock_path_value)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    print(f"[EULER_DISTRIBUTED] waiting for Isaac startup lock: {lock_path}", flush=True)
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    print(f"[EULER_DISTRIBUTED] acquired Isaac startup lock: {lock_path}", flush=True)
+    return lock_handle
+
+
+def _release_distributed_startup_lock(lock_handle) -> None:
+    if lock_handle is None:
+        return
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    lock_handle.close()
+    print("[EULER_DISTRIBUTED] released Isaac startup lock after environment setup", flush=True)
+
+
+def _wait_for_distributed_environment_barrier(global_rank: int, world_size: int) -> None:
+    """Wait until every rank has constructed its Isaac environment.
+
+    Isaac startup is serialized on Euler because concurrent Kit/PhysX startup
+    is not reliable.  Without this pre-NCCL barrier, the first rank enters
+    RL-Games' distributed rendezvous while the last rank is still constructing
+    its scene and can hit PyTorch's ten-minute TCPStore timeout.
+    """
+    if world_size <= 1:
+        return
+    barrier_path_value = os.getenv("ISAAC_RL_DISTRIBUTED_READY_DIR")
+    if not barrier_path_value:
+        raise RuntimeError(
+            "Distributed Isaac startup requires ISAAC_RL_DISTRIBUTED_READY_DIR."
+        )
+    barrier_path = Path(barrier_path_value)
+    barrier_path.mkdir(parents=True, exist_ok=True)
+    (barrier_path / f"rank_{global_rank}.ready").write_text("ready\n", encoding="utf-8")
+    print(
+        f"[EULER_DISTRIBUTED] rank {global_rank}/{world_size} waiting at environment barrier: "
+        f"{barrier_path}",
+        flush=True,
+    )
+    deadline = time.monotonic() + 30.0 * 60.0
+    while True:
+        ready_count = sum((barrier_path / f"rank_{rank}.ready").is_file() for rank in range(world_size))
+        if ready_count == world_size:
+            print(
+                f"[EULER_DISTRIBUTED] environment barrier complete ({ready_count}/{world_size})",
+                flush=True,
+            )
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for distributed environments: {ready_count}/{world_size} ready at "
+                f"{barrier_path}."
+            )
+        time.sleep(1.0)
+
+
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
+# Launch Omniverse and construct each distributed environment under one shared
+# lock. Multiple cold Isaac/PhysX startups on the same node have aborted in
+# native allocation code even when GPUs and writable caches were isolated.
+startup_lock_handle = _acquire_distributed_startup_lock()
+try:
+    app_launcher = AppLauncher(args_cli)
+except BaseException:
+    _release_distributed_startup_lock(startup_lock_handle)
+    raise
 simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
 import json
 import logging
-import os
 import random
 import time
 from datetime import datetime
@@ -150,10 +246,16 @@ from grasp_planning.d405_wrist_camera import (
     VISUAL_SERVO_OBSERVATION_WIDTH,
 )
 from grasp_planning.rl.distributed_observer import DistributedSafeIsaacAlgoObserver
+from grasp_planning.rl.fabrica_dataset import (
+    DEFAULT_DATASET_INDEX,
+    FABRICA_TASK_ID,
+    configure_fabrica_env_cfg,
+)
 from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context
 from grasp_planning.rl.policy_timing import PHYSICS_RATE_HZ, POLICY_RATE_HZ
 from grasp_planning.rl.ppo_batching import resolve_local_minibatch_size
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
+from grasp_planning.rl.training_profiles import apply_training_profile
 from isaac_rl.tasks.direct.isaac_rl.agents.completion_ppo import (
     register_grasp_completion_runner,
 )
@@ -212,7 +314,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     global_rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("ISAAC_RL_ORIGINAL_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
     world_size = int(os.getenv("WORLD_SIZE", "1"))
+    fabrica_shard = None
+    if args_cli.task == FABRICA_TASK_ID:
+        fabrica_shard = configure_fabrica_env_cfg(
+            env_cfg,
+            rank=global_rank,
+            world_size=world_size,
+            explicit_shard=args_cli.dataset_shard,
+            index_path=args_cli.dataset_index or DEFAULT_DATASET_INDEX,
+        )
+        print(
+            f"[INFO] Fabrica dataset={fabrica_shard.dataset_name} "
+            f"shard={fabrica_shard.shard_index}/{fabrica_shard.shard_count} "
+            f"targets={fabrica_shard.target_count} parts={len(fabrica_shard.part_names)}",
+            flush=True,
+        )
     sim2real_profile = apply_sim2real_profile(env_cfg, args_cli.sim2real_profile)
+    training_profile = apply_training_profile(env_cfg, agent_cfg, args_cli.training_profile)
     context_spec = resolve_policy_context(args_cli.policy_context)
     env_cfg.policy_context_mode = context_spec.name
     env_cfg.observation_space = policy_observation_size(
@@ -229,6 +347,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "policy_rate_hz": POLICY_RATE_HZ,
         "physics_rate_hz": PHYSICS_RATE_HZ,
         "overrides": dict(sim2real_profile.overrides),
+        "training_profile": training_profile.metadata(),
         "policy_context": {
             "mode": context_spec.name,
             "size": context_spec.size,
@@ -248,9 +367,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "effective_global_minibatch_size": None,
             "optimizer_updates_per_epoch": None,
         },
+        "dataset": None if fabrica_shard is None else fabrica_shard.metadata(),
     }
     EssentialSummaryWriter._run_metadata = run_profile_metadata
     print(f"[INFO] Sim-to-real profile: {sim2real_profile.identifier} ({sim2real_profile.description})")
+    print(f"[INFO] Training profile: {training_profile.identifier} ({training_profile.description})")
     print(
         f"[INFO] Policy context: {context_spec.name} ({context_spec.size} values); "
         f"full observation={env_cfg.observation_space}"
@@ -349,7 +470,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = os.path.join(log_root_path, log_dir)
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    try:
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    finally:
+        _release_distributed_startup_lock(startup_lock_handle)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -463,6 +587,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not wandb.run.resumed:
             wandb.config.update({"env_cfg": env_cfg.to_dict()})
             wandb.config.update({"agent_cfg": agent_cfg})
+
+    _wait_for_distributed_environment_barrier(global_rank, world_size)
 
     if args_cli.checkpoint is not None:
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})

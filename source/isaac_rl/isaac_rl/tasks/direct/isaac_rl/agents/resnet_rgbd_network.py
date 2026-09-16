@@ -10,10 +10,10 @@ from rl_games.algos_torch.network_builder import NetworkBuilder
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 
-# The local workstation currently uses an NVIDIA 570 driver, which exposes the
-# CUDA 12.8 device but cannot initialize this image's cuDNN 9.2 runtime. Euler's
-# 580 driver is unaffected. Allow local inference/evaluation to use PyTorch's
-# non-cuDNN CUDA convolution path without changing training by default.
+# This image can load kit's cuDNN 9.20 instead of PyTorch's bundled 9.7, causing
+# initialization failure on the local 570 driver. The Franka Python wrapper
+# selects the bundled 9.7 libraries. Retain an explicit non-cuDNN fallback for
+# other callers, without changing their default backend.
 if os.environ.get("ISAAC_RL_DISABLE_CUDNN") == "1":
     torch.backends.cudnn.enabled = False
 
@@ -251,11 +251,19 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         pose_prediction = self.pose_head(geometry_features)
 
         if obs_dict.get("is_train", True):
-            position_loss = F.smooth_l1_loss(pose_prediction[:, :3], pose_target[:, :3])
-            rotation_loss = F.smooth_l1_loss(pose_prediction[:, 3:], pose_target[:, 3:])
+            policy_train_mask = (completion_target[:, 1] >= 0.0).to(dtype=pose_prediction.dtype)
+            active_count = policy_train_mask.sum().clamp_min(1.0)
+            position_loss = F.smooth_l1_loss(
+                pose_prediction[:, :3], pose_target[:, :3], reduction="none"
+            ).mean(dim=-1)
+            rotation_loss = F.smooth_l1_loss(
+                pose_prediction[:, 3:], pose_target[:, 3:], reduction="none"
+            ).mean(dim=-1)
+            position_loss = (position_loss * policy_train_mask).sum() / active_count
+            rotation_loss = (rotation_loss * policy_train_mask).sum() / active_count
             self.aux_loss_map["pose_aux_loss"] = self.pose_loss_weight * (position_loss + rotation_loss)
             completion_label = completion_target[:, 0]
-            completion_supervised = completion_target[:, 1]
+            completion_supervised = completion_target[:, 1].clamp(0.0, 1.0)
             completion_loss = F.binary_cross_entropy_with_logits(
                 completion_logits.squeeze(-1),
                 completion_label,

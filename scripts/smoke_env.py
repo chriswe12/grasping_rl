@@ -15,6 +15,8 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser()
 parser.add_argument("--steps", type=int, default=10)
 parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument("--dataset-index", type=Path, default=None)
+parser.add_argument("--dataset-shard", type=int, default=None)
 parser.add_argument(
     "--task",
     default=None,
@@ -58,6 +60,19 @@ parser.add_argument(
     default="action",
     help="Deployment-measurable actor context to validate.",
 )
+parser.add_argument(
+    "--training-profile",
+    choices=(
+        "baseline",
+        "long_run_improved",
+        "robust_no_reward_change",
+        "robust_reward_change",
+        "lift_conservative",
+        "lift_primary",
+    ),
+    default="baseline",
+    help="Apply the environment half of a named training profile.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -70,8 +85,15 @@ from grasp_planning.d405_wrist_camera import (
     VISUAL_SERVO_OBSERVATION_HEIGHT,
     VISUAL_SERVO_OBSERVATION_WIDTH,
 )
+from grasp_planning.rl.fabrica_dataset import (
+    DEFAULT_DATASET_INDEX,
+    FABRICA_PLAY_TASK_ID,
+    FABRICA_TASK_ID,
+    configure_fabrica_env_cfg,
+)
 from grasp_planning.rl.policy_context import policy_observation_size, resolve_policy_context
 from grasp_planning.rl.sim2real_profiles import apply_sim2real_profile
+from grasp_planning.rl.training_profiles import apply_training_environment_profile
 
 from isaaclab_tasks.utils import parse_env_cfg
 
@@ -84,12 +106,25 @@ cfg = parse_env_cfg(
     num_envs=args.num_envs,
 )
 cfg.seed = 7
+if task_id in (FABRICA_TASK_ID, FABRICA_PLAY_TASK_ID):
+    shard = configure_fabrica_env_cfg(
+        cfg,
+        explicit_shard=args.dataset_shard,
+        index_path=args.dataset_index or DEFAULT_DATASET_INDEX,
+    )
+    print(
+        f"[SMOKE] dataset={shard.dataset_name} shard={shard.shard_index}/{shard.shard_count} "
+        f"targets={shard.target_count} parts={len(shard.part_names)}",
+        flush=True,
+    )
 context_spec = resolve_policy_context(args.policy_context)
 cfg.policy_context_mode = context_spec.name
 cfg.observation_space = policy_observation_size(
     context_spec.name,
     image_value_count=VISUAL_SERVO_OBSERVATION_HEIGHT * VISUAL_SERVO_OBSERVATION_WIDTH * 8,
 )
+training_profile = apply_training_environment_profile(cfg, args.training_profile)
+print(f"[SMOKE] training_profile={training_profile.identifier}", flush=True)
 print(
     f"[SMOKE] policy_context={context_spec.name} context_size={context_spec.size} "
     f"observation_size={cfg.observation_space}",
@@ -180,12 +215,11 @@ print(
     f"range=[{float(initial_rotation_deg.min()):.2f}, {float(initial_rotation_deg.max()):.2f}]",
     flush=True,
 )
-with torch.inference_mode():
-    ever_done = False
-    for _ in range(args.steps):
-        actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
-        observation, reward, terminated, truncated, info = env.step(actions)
-        ever_done |= bool(torch.any(terminated | truncated))
+ever_done = False
+for _ in range(args.steps):
+    actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+    observation, reward, terminated, truncated, info = env.step(actions)
+    ever_done |= bool(torch.any(terminated | truncated))
 log = info.get("log", {})
 print(
     f"[SMOKE] steps={args.steps} reward={float(reward.mean()):.4f} "
@@ -203,7 +237,22 @@ if args.declare_completion:
     completion_terminated = torch.zeros(env.unwrapped.num_envs, dtype=torch.bool, device=env.unwrapped.device)
     completion_truncated = completion_terminated.clone()
     completion_info = {}
-    for _ in range(int(cfg.completion_required_consecutive_steps)):
+    maximum_completion_steps = (
+        int(cfg.completion_required_consecutive_steps)
+        + round(
+            (
+                float(cfg.lift_close_duration_s)
+                + float(cfg.lift_gravity_release_duration_s)
+                + float(cfg.lift_height_m) / float(cfg.lift_speed_m_s)
+                + float(cfg.lift_hold_duration_s)
+            )
+            / float(env.unwrapped.step_dt)
+        )
+        + 5
+        if bool(cfg.lift_reward_enabled)
+        else int(cfg.completion_required_consecutive_steps)
+    )
+    for _ in range(maximum_completion_steps):
         (
             _,
             completion_reward,
@@ -211,12 +260,22 @@ if args.declare_completion:
             completion_truncated,
             completion_info,
         ) = env.step(actions)
+        if bool(torch.any(completion_terminated | completion_truncated)):
+            break
     completion_evaluation = completion_info.get("evaluation", {})
     print(
         "[SMOKE] explicit_completion "
         f"reward={float(completion_reward.mean()):.4f} "
         f"done={bool(torch.any(completion_terminated | completion_truncated))} "
-        f"correct={float(completion_evaluation.get('success', torch.zeros(1)).float().mean()):.3f} "
+        f"strict={float(completion_evaluation.get('strict_success', torch.zeros(1)).float().mean()):.3f} "
+        f"operational="
+        f"{float(completion_evaluation.get('operational_success', torch.zeros(1)).float().mean()):.3f} "
+        f"pickup="
+        f"{float(completion_evaluation.get('physical_pickup_success', torch.zeros(1)).float().mean()):.3f} "
+        f"task_success="
+        f"{float(completion_evaluation.get('task_success', torch.zeros(1)).float().mean()):.3f} "
+        f"lift_mm="
+        f"{float(completion_evaluation.get('lift_final_height_m', torch.zeros(1)).float().mean()) * 1000.0:.1f} "
         f"premature={float(completion_evaluation.get('premature_completion', torch.zeros(1)).float().mean()):.3f}",
         flush=True,
     )

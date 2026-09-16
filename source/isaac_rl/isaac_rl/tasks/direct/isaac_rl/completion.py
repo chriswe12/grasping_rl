@@ -9,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class CompletionMasks:
-    """Privileged training/evaluation masks; never actor inputs at deployment."""
+    """Privileged operational masks; never actor inputs at deployment."""
 
     ready: torch.Tensor
     definitely_not_ready: torch.Tensor
@@ -26,7 +26,7 @@ def completion_masks(
     negative_rotation_rad: float,
     collision_free: torch.Tensor | None = None,
 ) -> CompletionMasks:
-    """Build strict-positive, clear-negative, and ambiguity-ignore masks."""
+    """Build operational-positive, clear-negative, and ambiguity-ignore masks."""
 
     if position_error_m.shape != rotation_error_rad.shape:
         raise ValueError("Position and rotation errors must have the same shape.")
@@ -48,6 +48,48 @@ def completion_masks(
         definitely_not_ready=definitely_not_ready,
         supervised=ready | definitely_not_ready,
     )
+
+
+def completion_quality(
+    position_error_m: torch.Tensor,
+    rotation_error_rad: torch.Tensor,
+    *,
+    ready_position_m: float,
+    ready_rotation_rad: float,
+    negative_position_m: float,
+    negative_rotation_rad: float,
+    collision_free: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return a continuous operational-completion quality in ``[0, 1]``.
+
+    Quality is one throughout the operational acceptance region, zero once
+    either clear-negative threshold is reached, and tapers linearly through
+    the ambiguity band. Taking the minimum makes both translation and
+    rotation necessary without introducing a discontinuous terminal cliff.
+    """
+
+    masks = completion_masks(
+        position_error_m,
+        rotation_error_rad,
+        ready_position_m=ready_position_m,
+        ready_rotation_rad=ready_rotation_rad,
+        negative_position_m=negative_position_m,
+        negative_rotation_rad=negative_rotation_rad,
+        collision_free=collision_free,
+    )
+    del masks  # validation is shared with the binary label contract above
+    position_quality = (
+        (float(negative_position_m) - position_error_m)
+        / (float(negative_position_m) - float(ready_position_m))
+    ).clamp(0.0, 1.0)
+    rotation_quality = (
+        (float(negative_rotation_rad) - rotation_error_rad)
+        / (float(negative_rotation_rad) - float(ready_rotation_rad))
+    ).clamp(0.0, 1.0)
+    quality = torch.minimum(position_quality, rotation_quality)
+    if collision_free is not None:
+        quality = quality * collision_free.bool().to(dtype=quality.dtype)
+    return quality
 
 
 def completion_declared(stop_action: torch.Tensor, *, threshold: float) -> torch.Tensor:
@@ -75,6 +117,32 @@ def completion_terminal_reward(
     return reward
 
 
+def graded_completion_terminal_reward(
+    declared: torch.Tensor,
+    quality: torch.Tensor,
+    *,
+    correct_reward: float,
+    premature_penalty: float,
+) -> torch.Tensor:
+    """Return a smooth declaration reward from operational pose quality.
+
+    A declaration inside the operational region receives ``correct_reward``;
+    one beyond the clear-negative boundary receives ``-premature_penalty``.
+    Intermediate poses interpolate continuously between those outcomes.
+    """
+
+    if declared.shape != quality.shape:
+        raise ValueError("declared and quality must have the same shape.")
+    if not torch.is_floating_point(quality):
+        raise ValueError("quality must be a floating-point tensor.")
+    bounded_quality = quality.clamp(0.0, 1.0)
+    declared_reward = (
+        -float(premature_penalty)
+        + (float(correct_reward) + float(premature_penalty)) * bounded_quality
+    )
+    return declared.float() * declared_reward
+
+
 def update_completion_streak(
     previous_streak: torch.Tensor,
     completion_probability: torch.Tensor,
@@ -95,6 +163,8 @@ __all__ = [
     "CompletionMasks",
     "completion_declared",
     "completion_masks",
+    "completion_quality",
     "completion_terminal_reward",
+    "graded_completion_terminal_reward",
     "update_completion_streak",
 ]

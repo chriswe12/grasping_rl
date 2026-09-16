@@ -47,7 +47,10 @@ from grasp_planning.d405_wrist_camera import (  # noqa: E402
     camera_pose_in_link7,
 )
 from grasp_planning.grasping.fabrica_grasp_debug import load_grasp_bundle  # noqa: E402
-from grasp_planning.isaac_visual_materials import VISUAL_SERVO_MATERIAL_PROFILE  # noqa: E402
+from grasp_planning.isaac_visual_materials import (  # noqa: E402
+    VISUAL_SERVO_MATERIAL_PROFILE,
+    VISUAL_SERVO_PART_PALETTE,
+)
 from grasp_planning.isaac_visual_scene import VISUAL_SERVO_SCENE_PROFILE  # noqa: E402
 from grasp_planning.mujoco import build_bundle_local_mesh  # noqa: E402
 from grasp_planning.rl.goal_catalog_profiles import (  # noqa: E402
@@ -157,6 +160,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-depth-std-m", type=float, default=0.01)
     parser.add_argument("--target-indices", type=int, nargs="+", default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)
+    parser.add_argument(
+        "--goal-palette-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Render true color-conditioned goal variants at 128x72. Recommended balanced subset: "
+            "0 2 3 9 19 23. Omit to preserve the legacy single-goal-color artifact size."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -531,6 +544,15 @@ def _apply_filament_materials(model: mujoco.MjModel) -> None:
     model.light_castshadow[:] = 0
 
 
+def _policy_area_downsample(rgb: np.ndarray) -> np.ndarray:
+    """Exactly average the 256x144 render into the policy's 128x72 RGB grid."""
+
+    if rgb.shape != (HEIGHT, WIDTH, 3) or HEIGHT % 2 or WIDTH % 2:
+        raise ValueError(f"Unexpected goal render shape for 2x area resize: {rgb.shape}.")
+    averaged = rgb.reshape(HEIGHT // 2, 2, WIDTH // 2, 2, 3).mean(axis=(1, 3))
+    return np.clip(np.rint(averaged), 0.0, 255.0).astype(np.uint8)
+
+
 def _tcp_pose(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -574,6 +596,13 @@ def main() -> None:  # noqa: C901
             raise ValueError(f"--target-indices must be unique values in [0, {source_count - 1}].")
         payload = _select_targets(payload, indices)
     target_count = len(payload["target_ids"])
+    goal_palette_indices: tuple[int, ...] = ()
+    if args.goal_palette_indices is not None:
+        goal_palette_indices = tuple(int(value) for value in args.goal_palette_indices)
+        if len(goal_palette_indices) < 3 or len(set(goal_palette_indices)) != len(goal_palette_indices):
+            raise ValueError("--goal-palette-indices requires at least three unique indices.")
+        if min(goal_palette_indices) < 0 or max(goal_palette_indices) >= len(VISUAL_SERVO_PART_PALETTE):
+            raise ValueError("A --goal-palette-indices value lies outside the part palette.")
     if str(np.asarray(payload.get("robot_profile", "")).item()) != VISUAL_SERVO_GRIPPER_PROFILE:
         raise ValueError("Path asset was not rebuilt for the active PDZ robot profile.")
     if str(np.asarray(payload.get("approach_gripper_profile", "")).item()) != PDZ_GRIPPER_APPROACH_PROFILE:
@@ -589,6 +618,11 @@ def main() -> None:  # noqa: C901
     depth = np.empty((target_count, HEIGHT, WIDTH), dtype=np.float32)
     position_errors = np.empty(target_count, dtype=np.float32)
     rotation_errors = np.empty(target_count, dtype=np.float32)
+    goal_rgb_policy_variants = (
+        np.empty((target_count, len(goal_palette_indices), HEIGHT // 2, WIDTH // 2, 3), dtype=np.uint8)
+        if goal_palette_indices
+        else None
+    )
 
     with tempfile.TemporaryDirectory(prefix="mujoco_pdz_goal_catalog_") as temp_name:
         temporary = Path(temp_name)
@@ -602,6 +636,11 @@ def main() -> None:  # noqa: C901
             _build_bundle_mesh(part, part_mesh)
             model = _scene_model(robot_mjcf, robot_urdf, part_mesh)
             _apply_filament_materials(model)
+            part_material_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_MATERIAL, "part_canonical"
+            )
+            if part_material_id < 0:
+                raise RuntimeError("MuJoCo material 'part_canonical' was not compiled.")
             data = mujoco.MjData(model)
             renderer = mujoco.Renderer(model, height=HEIGHT, width=WIDTH)
             try:
@@ -644,6 +683,17 @@ def main() -> None:  # noqa: C901
                     )
                     renderer.update_scene(data, camera="d405")
                     rgb[target_index] = renderer.render()
+                    if goal_rgb_policy_variants is not None:
+                        canonical_color = model.mat_rgba[part_material_id, :3].copy()
+                        for variant_slot, palette_index in enumerate(goal_palette_indices):
+                            model.mat_rgba[part_material_id, :3] = VISUAL_SERVO_PART_PALETTE[
+                                palette_index
+                            ].color
+                            renderer.update_scene(data, camera="d405")
+                            goal_rgb_policy_variants[target_index, variant_slot] = _policy_area_downsample(
+                                renderer.render()
+                            )
+                        model.mat_rgba[part_material_id, :3] = canonical_color
                     renderer.enable_depth_rendering()
                     renderer.update_scene(data, camera="d405")
                     depth[target_index] = renderer.render()
@@ -688,6 +738,9 @@ def main() -> None:  # noqa: C901
             "goal_observation_profile": np.asarray(D405_VISUAL_SERVO_OBSERVATION_PROFILE),
         }
     )
+    if goal_rgb_policy_variants is not None:
+        payload["goal_rgb_policy_variants"] = goal_rgb_policy_variants
+        payload["goal_variant_palette_indices"] = np.asarray(goal_palette_indices, dtype=np.int16)
     failures = []
     for index in np.flatnonzero(failure).tolist():
         reasons = []

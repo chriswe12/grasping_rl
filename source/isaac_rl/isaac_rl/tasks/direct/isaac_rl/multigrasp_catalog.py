@@ -101,6 +101,28 @@ def load_multigrasp_catalog(  # noqa: C901 - strict schema validation is intenti
         raise ValueError(f"goal_rgb must be uint8, got {rgb.dtype}.")
     if not np.issubdtype(depth.dtype, np.floating) or not np.isfinite(depth).all():
         raise ValueError("goal_depth must be a finite floating-point array.")
+    has_policy_variants = "goal_rgb_policy_variants" in arrays
+    has_palette_indices = "goal_variant_palette_indices" in arrays
+    if has_policy_variants != has_palette_indices:
+        raise ValueError(
+            "Color-conditioned goals require both goal_rgb_policy_variants and "
+            "goal_variant_palette_indices."
+        )
+    if has_policy_variants:
+        variants = _require_shape(
+            arrays, "goal_rgb_policy_variants", (target_count, None, 72, 128, 3)
+        )
+        palette_indices = _require_shape(
+            arrays, "goal_variant_palette_indices", (variants.shape[1],)
+        )
+        if variants.dtype != np.uint8:
+            raise ValueError("goal_rgb_policy_variants must use uint8.")
+        if not np.issubdtype(palette_indices.dtype, np.integer):
+            raise ValueError("goal_variant_palette_indices must use an integer dtype.")
+        if len(np.unique(palette_indices)) != len(palette_indices):
+            raise ValueError("goal_variant_palette_indices must be unique.")
+        if np.any(palette_indices < 0) or np.any(palette_indices >= 24):
+            raise ValueError("goal_variant_palette_indices contains an unsupported palette index.")
 
     for name, width in (
         ("object_positions_w", 3),
@@ -294,6 +316,7 @@ def select_catalog_split(
         "orientation_indices",
         "grasp_ids",
         "goal_rgb",
+        "goal_rgb_policy_variants",
         "goal_depth",
         "object_positions_w",
         "object_orientations_xyzw_w",
