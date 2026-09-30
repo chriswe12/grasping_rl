@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "isaac_rl/source/isaac_rl"))
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--catalog", type=Path, default=ROOT / "isaac_rl/data/franka_zed_cube/catalog.npz")
-parser.add_argument("--camera-profile", type=Path, default=ROOT / "configs/franka_zed_mini.json")
+parser.add_argument("--camera-profile", type=Path, help="Optional exact catalog-matching camera override")
 parser.add_argument("--object-usd", default="")
 parser.add_argument("--robot-asset-manifest", default="", help="Verified offline mirror of the exact Panda USD")
 parser.add_argument("--gripper-open-width", type=float, default=0.06)
@@ -28,6 +28,16 @@ parser.add_argument(
 parser.add_argument("--experiment-name", help="Shared run name; required for multiple distributed ranks")
 parser.add_argument("--global-minibatch-size", type=int, default=1024)
 parser.add_argument("--iterations", type=int, default=2000)
+parser.add_argument(
+    "--symmetry-training",
+    action="store_true",
+    help="Use equivalent object-symmetry TCPs for rewards, success and supervision (new checkpoint contract)",
+)
+parser.add_argument(
+    "--symmetry-objective",
+    choices=["coupled_ready_minimax_tcp_v1", "orbit_potential_pose_set_v2"],
+    help="Defaults to v2 for new symmetry runs; preserves an explicit checkpoint objective",
+)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--run-dir", type=Path, default=ROOT / "logs/franka_zed")
 parser.add_argument("--checkpoint", type=Path)
@@ -47,6 +57,9 @@ parser.add_argument(
 parser.add_argument("--catalog-split", choices=("train", "validation", "test", "all"), default="train")
 parser.add_argument("--evaluation-steps", type=int, default=600)
 parser.add_argument(
+    "--pose-evaluation-progress", type=float, default=0.0, help="Pose-bank condition: 0, .25, .5, .75 or .94"
+)
+parser.add_argument(
     "--dry-run", action="store_true", help="Build the player and check one inference; no optimizer or training"
 )
 parser.add_argument(
@@ -64,6 +77,8 @@ for index in range(len(sys.argv) - 2, 0, -1):
 args = parser.parse_args()
 if args.num_envs < 1 or args.iterations < 1 or not str(args.device).startswith("cuda"):
     parser.error("Use positive environments/iterations and a CUDA device")
+if args.symmetry_objective and not args.symmetry_training:
+    parser.error("--symmetry-objective requires --symmetry-training")
 if args.evaluate and (not args.checkpoint or args.catalog_split == "train"):
     parser.error("Evaluation needs --checkpoint and a held-out --catalog-split")
 world_size = int(os.environ.get("WORLD_SIZE", "1")) if args.distributed else 1
@@ -130,6 +145,10 @@ class FrankaTrainingObserver(DistributedSafeIsaacAlgoObserver):
         super().after_init(algo)
         self.writer = algo.writer
         self.algorithm = algo
+        if self.environment.cfg.training_recipe:
+            # The scheduler was constructed with the full learning budget.
+            # Stop this allocation at its segment boundary without annealing to zero there.
+            algo.max_epochs = args.iterations
         import torch
 
         backend = dict(
@@ -174,13 +193,19 @@ def save_wrist_preview(environment, path):
     return float(image_std.min())
 
 
-def main():
-    cfg = FrankaZedEnvCfg()
-    cfg.scene.num_envs = args.num_envs
-    cfg.sim.device = args.device
-    cfg.seed = args.seed + global_rank
-    cfg.catalog_path = str(args.catalog)
-    cfg.catalog_split = args.catalog_split
+def configure_symmetry_objective(cfg):
+    if args.symmetry_training:
+        saved_objective = None
+        if args.checkpoint and args.checkpoint.with_suffix(".contract.json").exists():
+            saved_objective = (
+                json.loads(args.checkpoint.with_suffix(".contract.json").read_text())
+                .get("symmetry_training", {})
+                .get("objective")
+            )
+        cfg.symmetry_objective = args.symmetry_objective or saved_objective or "orbit_potential_pose_set_v2"
+
+
+def configure_evaluation(cfg):
     if args.evaluate:
         import numpy as np
 
@@ -203,7 +228,29 @@ def main():
         cfg.reset_ready_fraction = 0.0
         cfg.fixed_waypoint_index = 0
         cfg.sequential_target_assignment = True
-    cfg.camera_profile_path = str(args.camera_profile)
+
+
+def validate_checkpoint_contract(contract):
+    if args.checkpoint:
+        # A checkpoint's sidecar is copied beside it when sharing/resuming.
+        sidecar = args.checkpoint.with_suffix(".contract.json")
+        if not sidecar.is_file() or json.loads(sidecar.read_text()) != contract:
+            raise ValueError("Checkpoint needs a matching .contract.json sidecar; refusing cross-camera resume")
+
+
+def main():
+    cfg = FrankaZedEnvCfg()
+    cfg.scene.num_envs = args.num_envs
+    cfg.sim.device = args.device
+    cfg.seed = args.seed + global_rank
+    cfg.catalog_path = str(args.catalog)
+    cfg.catalog_split = args.catalog_split
+    cfg.symmetry_training = args.symmetry_training
+    configure_symmetry_objective(cfg)
+    cfg.pose_evaluation = args.evaluate
+    cfg.pose_evaluation_progress = args.pose_evaluation_progress
+    configure_evaluation(cfg)
+    cfg.camera_profile_path = args.camera_profile
     cfg.object_usd_path = args.object_usd
     cfg.robot_asset_manifest = args.robot_asset_manifest
     cfg.gripper_open_width_m = args.gripper_open_width
@@ -213,15 +260,30 @@ def main():
         release_startup_lock(startup_lock)
     environment_barrier(global_rank, world_size)
     contract = env.unwrapped.contract()
-    if args.checkpoint:
-        # A checkpoint's sidecar is copied beside it when sharing/resuming.
-        sidecar = args.checkpoint.with_suffix(".contract.json")
-        if not sidecar.is_file() or json.loads(sidecar.read_text()) != contract:
-            raise ValueError("Checkpoint needs a matching .contract.json sidecar; refusing cross-camera resume")
+    validate_checkpoint_contract(contract)
     config_path = ROOT / "isaac_rl/source/isaac_rl/isaac_rl/tasks/direct/isaac_rl/agents/rl_games_ppo_cfg.yaml"
     config = yaml.safe_load(config_path.read_text())
+    if env.unwrapped.cfg.training_recipe:
+        from copy import deepcopy
+
+        config = deepcopy(env.unwrapped.cfg.training_recipe["agent"])
+        if args.checkpoint and not (args.evaluate or args.dry_run):
+            import torch
+
+            resumed = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+            from grasp_planning.rl.franka_performance import resume_epoch_for_frames
+
+            horizon = config["params"]["config"]["horizon_length"]
+            frames = int(resumed["frame"])
+            expected_epoch = resume_epoch_for_frames(frames, args.num_envs * world_size, horizon)
+            if int(resumed["epoch"]) != expected_epoch:
+                raise ValueError("Resume batch size changed: explicitly rebase checkpoint epoch from its frame count")
+            env.unwrapped.pose_curriculum_offset = frames // (args.num_envs * world_size)
+            del resumed
     # RL-Games adds global_rank itself; keep environment and learner seeds aligned.
     config["params"]["seed"] = args.seed
+    if cfg.symmetry_training and cfg.symmetry_objective == "orbit_potential_pose_set_v2":
+        config["params"]["network"].update(pose_target_size=24, symmetry_aux=env.unwrapped.symmetry_aux_config)
     config["params"]["network"]["pretrained"] = not args.no_pretrained
     run = args.run_dir / (args.experiment_name or datetime.now().strftime("%Y%m%d_%H%M%S"))
     run.mkdir(parents=True, exist_ok=args.distributed)
@@ -234,7 +296,9 @@ def main():
         device_name=args.device,
         num_actors=args.num_envs,
         multi_gpu=args.distributed and not args.dry_run,
-        max_epochs=args.iterations,
+        max_epochs=(163_840_000 // (args.num_envs * world_size * train["horizon_length"]))
+        if env.unwrapped.cfg.training_recipe
+        else args.iterations,
         save_best_after=0,
         save_frequency=min(args.save_frequency, args.iterations),
     )
@@ -246,6 +310,8 @@ def main():
     train["minibatch_size"] = batch
     train["central_value_config"]["minibatch_size"] = batch
     if global_rank == 0:
+        if env.unwrapped.symmetry_report is not None:
+            (run / "symmetry.json").write_text(json.dumps(env.unwrapped.symmetry_report, indent=2) + "\n")
         (run / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
         (run / "camera.json").write_text(json.dumps(env.unwrapped.camera_profile, indent=2) + "\n")
         (run / "agent.yaml").write_text(yaml.safe_dump(config))
@@ -269,8 +335,11 @@ def main():
                         if contract.get("appearance_randomization")
                         else "provisional_zed_rgb_gain_only"
                     ),
-                    "physics_hz": 120,
-                    "policy_hz": 15,
+                    "physics_hz": 1.0 / env.unwrapped.physics_dt,
+                    "policy_hz": 1.0 / env.unwrapped.step_dt,
+                    "training_recipe": env.unwrapped.cfg.training_recipe,
+                    "pose_evaluation_progress": args.pose_evaluation_progress if args.evaluate else None,
+                    "curriculum_offset": getattr(env.unwrapped, "pose_curriculum_offset", 0),
                 },
                 indent=2,
             )
@@ -359,6 +428,10 @@ def main():
                     break
             report = {
                 "checkpoint": str(args.checkpoint),
+                "pose_evaluation_progress": args.pose_evaluation_progress
+                if env.unwrapped.cfg.training_recipe
+                else None,
+                "policy_hz": 1.0 / env.unwrapped.step_dt,
                 "catalog_split": args.catalog_split,
                 "episodes": episodes,
                 "episode_count": len(episodes),

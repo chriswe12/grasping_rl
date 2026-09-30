@@ -25,6 +25,17 @@ previous six executed motion actions, which are available at deployment. The
 fusion retains live and goal features together with signed difference,
 absolute difference, and elementwise agreement maps.
 
+The two-image ablation sets the catalog recipe's network fields
+`visual_fusion: paired` and `use_policy_context: false`. It concatenates only
+live and goal RGB-D feature maps; it adds no explicit signed/absolute difference
+or product maps, and the actor ignores previous actions. Learned image features,
+pose/completion supervision, and the training-only centralized critic remain.
+Defaults preserve the original architecture. Checkpoints from the two fusion
+architectures are not interchangeable. `scripts/build_franka_pair_only_catalog.py`
+creates a separate 128×72 catalog from higher-resolution references using area
+filtering while preserving target poses, splits, placement banks and appearance
+variants. Its report records source/output hashes; it does not overwrite its input.
+
 During simulator training, the flattened visual observation is followed by the
 previous six motion actions, six normalized camera-frame pose-error labels, a
 completion label, and a supervision mask. The network slices the final eight
@@ -479,3 +490,67 @@ split may be changed explicitly to inspect validation or training targets:
 Evaluation reports aggregate, per-part, per-orientation, and per-target errors
 and success. Use validation while selecting a checkpoint and run test only for
 the final held-out result.
+
+### Symmetry-aware Franka training
+
+Add `--symmetry-training` to `scripts/train_franka_zed.py` (or the forwarded
+arguments of `euler/submit.sh franka-train`) for a **new run**. The option is off
+by default to preserve existing checkpoint objectives. It enables validated
+finite and continuous object symmetries for static-object tasks. One equivalent
+TCP pose supplies both position and orientation errors: dense progress/precision
+rewards, completion success/premature rewards, completion labels, auxiliary pose
+targets, critic errors, and reset potential initialization use that same rule.
+Divergence separately checks whether any equivalent pose is within its existing
+limits. Collision, velocity/stability and declaration gates are unchanged.
+
+The reference RGB-D image remains the selected canonical grasp view. Symmetry
+information is privileged reward/supervision data, not a new actor input. This
+does not admit arbitrary alternative grasps or an unaudited gripper flip.
+
+Checkpoint contracts record the objective, readiness tolerances and symmetry
+asset hashes. Nominal checkpoints cannot silently resume with this flag; this
+change does not migrate their optimizer state. Supply the flag when evaluating
+or continuing a symmetry-trained checkpoint; Euler post-training evaluation
+forwards it automatically. Catalogs themselves need not be regenerated. Portable
+Euler snapshots must include catalog-referenced source bundles, Fabrica symmetry
+JSON files and meshes referenced by the continuous-symmetry audit. Missing or
+changed provenance fails closed. `symmetry.json` in the run records coverage.
+
+Local two-epoch GPU smoke and verification evidence:
+`../artifacts/franka_symmetry_training_20260927/`. Existing cluster runs were not
+modified. This smoke validates execution, not learning performance or real pickup.
+
+### Consistent symmetry objective (v2)
+
+New `train_franka_zed.py --symmetry-training` runs default to
+`orbit_potential_pose_set_v2`. Dense progress is the difference of a single
+potential: the maximum of the existing weighted position/rotation progress
+and exponential precision potential over valid equivalent TCP poses. Readiness
+still requires one equivalent TCP to satisfy both tolerances; collision,
+stability, terminal and other action penalties retain their existing rules.
+
+The six-output auxiliary pose head uses a minimum pose-set loss, with normalized
+translation SmoothL1 and geodesic rotation SmoothL1 (scaled by one third to retain
+the old loss's small-angle curvature). Its privileged descriptor contains local
+TCP/goal poses, camera rotation and a normalized symmetry-set index (24 values).
+These labels never feed the actor or its completion head. Actor RGB-D inputs and
+previous-action configuration are unchanged. The agent artifact contains the
+validated orbit descriptors needed for auxiliary training; inference needs only
+zero placeholders, not object poses or symmetry information.
+
+Continuous axial optimization uses all 64 intervals of the full circle, with
+24 golden-section refinements per interval and explicit grid endpoints, together
+with finite representatives/cosets. This is numerical optimization, not an exact
+closed-form maximum; tests compare it with dense angular oracles. It costs more
+than finite-only selection. Reset baselines use the identical orbit potential.
+
+`--symmetry-objective coupled_ready_minimax_tcp_v1` explicitly selects the old
+objective. When resuming/evaluating an explicit checkpoint with
+`--symmetry-training`, its recorded objective is preserved unless overridden;
+a conflicting override fails contract validation. Direct `FrankaZedEnvCfg`
+callers retain v1 by default for existing benchmark compatibility and must set
+`symmetry_objective="orbit_potential_pose_set_v2"` to use v2. New code does not
+upgrade old policies or running jobs. V2 requires a pose-training recipe and
+changes the privileged observation contract; use the saved agent configuration
+when loading its policy. The legacy real-robot catalog loader has not been
+migrated to this new checkpoint contract.

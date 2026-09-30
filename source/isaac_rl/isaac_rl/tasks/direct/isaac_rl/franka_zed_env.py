@@ -23,9 +23,7 @@ from grasp_planning.rl.franka_training_scene import (
     make_franka_render_cfg,
 )
 from grasp_planning.rl.zed_mini import (
-    DEFAULT_ZED_PROFILE,
     damped_joint_velocity,
-    load_zed_profile,
     offset_jacobian,
     pack_zed_rgbd,
     profile_id,
@@ -41,6 +39,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import compute_pose_error, matrix_from_quat, quat_apply, quat_mul
 
 from .completion import completion_masks, completion_quality, graded_completion_terminal_reward
+from .franka_pose_recipe import FrankaPoseRecipeMixin
 
 TASK_ID = "Grasp-Franka-ZEDMini-RGBD-Direct-v0"
 DEFAULT_CATALOG = REPO_ROOT / "isaac_rl/data/franka_zed_cube/catalog.npz"
@@ -55,7 +54,9 @@ class FrankaZedEnvCfg(DirectRLEnvCfg):
     state_space = 26
     sim = sim_utils.SimulationCfg(dt=1 / 120, render_interval=8, render=make_franka_render_cfg())
     scene = FrankaTrainingSceneCfg(num_envs=16, env_spacing=2.0)
-    camera_profile_path = str(DEFAULT_ZED_PROFILE)
+    camera_profile_path = None
+    camera_profile_data = None
+    feature_lighting = None  # Explicit catalog-bound soft feature illumination.
     catalog_path = str(DEFAULT_CATALOG)
     catalog_split = "train"
     build_catalog = False
@@ -74,6 +75,10 @@ class FrankaZedEnvCfg(DirectRLEnvCfg):
     unsafe_contact_force_n = 3.0
     ready_position_m = 0.004
     ready_rotation_rad = 0.05235987756
+    # Evaluation only: retain the checkpoint's original training objective.
+    symmetry_evaluation = False
+    symmetry_training = False  # Opt-in objective, checkpoint-contract protected.
+    symmetry_objective = "coupled_ready_minimax_tcp_v1"  # Old direct callers remain compatible.
     negative_position_m = 0.008
     negative_rotation_rad = 0.10471975512
     reset_ready_fraction = 0.15
@@ -89,12 +94,21 @@ class FrankaZedEnvCfg(DirectRLEnvCfg):
     lab_appearance_seed = -1  # Nonnegative: seeded setup appearance, fixed across resets.
     lab_props = False  # Optional collision-enabled kinematic distractors.
     appearance_randomization = None  # Full profile lives in the catalog/checkpoint contract.
+    performance_profile = None
+    training_recipe = None
+    pose_reset_profile = None
+    placement_randomization = None
+    goal_randomization = None
+    depth_source = "legacy_image_plane"
+    goal_variant_index = -1  # -1 samples once per episode; 0 is original canonical.
+    pose_evaluation = False
+    pose_evaluation_progress = 0.0
 
 
-class FrankaZedEnv(DirectRLEnv):
+class FrankaZedEnv(FrankaPoseRecipeMixin, DirectRLEnv):
     cfg: FrankaZedEnvCfg
 
-    def __init__(self, cfg, render_mode=None, **kwargs):
+    def __init__(self, cfg, render_mode=None, **kwargs):  # noqa: C901 - ordered simulator initialization
         cfg = deepcopy(cfg)
         self.robot_usd_identity = cfg.scene.robot.spawn.usd_path
         self._multipart_source_parts = None
@@ -109,6 +123,23 @@ class FrankaZedEnv(DirectRLEnv):
         if not cfg.build_catalog and Path(cfg.catalog_path).is_file():
             with np.load(cfg.catalog_path, allow_pickle=False) as source:
                 stored = json.loads(str(source["contract_json"].item()))
+                cfg.camera_profile_data = stored.get("camera_profile_data")
+                cfg.feature_lighting = stored.get("feature_lighting")
+                cfg.performance_profile = stored.get("performance_profile")
+                cfg.training_recipe = stored.get("training_recipe")
+                cfg.pose_reset_profile = stored.get("pose_reset_profile")
+                cfg.placement_randomization = stored.get("placement_randomization")
+                cfg.goal_randomization = stored.get("goal_randomization")
+                cfg.depth_source = stored.get("depth_source", "legacy_image_plane")
+                if cfg.training_recipe:
+                    r = cfg.training_recipe["source_settings"]
+                    cfg.decimation = 8  # User requires 15 Hz policy, 120 Hz physics.
+                    cfg.sim.render_interval = 8
+                    cfg.episode_length_s = 15.0 if cfg.pose_evaluation else 12.0
+                    cfg.dls_damping = r["dls_damping"]
+                    cfg.unsafe_contact_force_n = r["unsafe_contact_force_threshold_n"]
+                    cfg.negative_position_m = r["completion_negative_position_m"]
+                    cfg.negative_rotation_rad = r["completion_negative_rotation_rad"]
                 if stored.get("object_assets"):
                     cfg.object_assets = stored["object_assets"]
                     selected = (
@@ -200,10 +231,31 @@ class FrankaZedEnv(DirectRLEnv):
                 prop_mode="authored_kinematic_v1",
                 layout="panda_left_mount_v1",
             )
-        self.camera_profile = load_zed_profile(cfg.camera_profile_path)
+        from grasp_planning.rl.zed_mini import resolve_zed_profile
+
+        self.camera_profile = resolve_zed_profile(
+            {"camera_profile_data": cfg.camera_profile_data}, cfg.camera_profile_path
+        )
         profile = self.camera_profile
+        cfg.observation_space = profile["observation_height"] * profile["observation_width"] * 8 + 14
+        if cfg.symmetry_training and cfg.symmetry_objective not in (
+            "coupled_ready_minimax_tcp_v1",
+            "orbit_potential_pose_set_v2",
+        ):
+            raise ValueError("Unsupported symmetry training objective")
+        if cfg.symmetry_training and cfg.symmetry_objective == "orbit_potential_pose_set_v2":
+            if not cfg.training_recipe:
+                raise ValueError("Symmetry potential v2 requires a pose training recipe")
+            cfg.observation_space += 18  # 24-value set descriptor replaces six pose labels.
         if not 0 < cfg.gripper_open_width_m <= 0.08:
             raise ValueError("Panda open width must be in (0, 0.08] metres")
+        if cfg.depth_source not in ("legacy_image_plane", "radial_to_optical_z_v1"):
+            raise ValueError("Unsupported depth source")
+        if cfg.depth_source == "radial_to_optical_z_v1":
+            cfg.scene.wrist_camera.data_types = ["rgb", "distance_to_camera"]
+            cfg.scene.wrist_camera.depth_clipping_behavior = "none"
+            # Radial clipping must not discard optical-Z-valid corner rays.
+            # Pack/reproject applies the policy's 1 m optical-Z limit afterwards.
         cfg.scene.wrist_camera.width = profile["render_width"]
         cfg.scene.wrist_camera.height = profile["render_height"]
         cfg.scene.wrist_camera.offset.pos = tuple(profile["position_m"])
@@ -212,7 +264,7 @@ class FrankaZedEnv(DirectRLEnv):
             intrinsic_matrix=scaled_intrinsics(profile, profile["render_width"], profile["render_height"]),
             width=profile["render_width"],
             height=profile["render_height"],
-            clipping_range=(0.01, profile["depth_max_m"]),
+            clipping_range=(0.01, profile["depth_max_m"] * (2 if cfg.depth_source == "radial_to_optical_z_v1" else 1)),
         )
         if cfg.object_assets:
             if cfg.object_usd_path:
@@ -262,6 +314,10 @@ class FrankaZedEnv(DirectRLEnv):
                 init_state=AssetBaseCfg.InitialStateCfg(pos=(0.4, -0.2, 1.5)),
                 spawn=sim_utils.SphereLightCfg(intensity=4000.0, radius=0.15, normalize=True),
             )
+        if cfg.performance_profile:
+            from grasp_planning.rl.franka_performance import configure_fast_render
+
+            configure_fast_render(cfg, cfg.performance_profile)
         super().__init__(cfg, render_mode, **kwargs)
         self.arm_ids, _ = self.robot.find_joints("panda_joint[1-7]", preserve_order=True)
         self.finger_ids, _ = self.robot.find_joints("panda_finger_joint[12]")
@@ -310,7 +366,54 @@ class FrankaZedEnv(DirectRLEnv):
                 self.scene.env_origins.cpu().tolist(),
                 self.lab_prop_names,
                 self.cfg.appearance_randomization,
+                fixed_wear=bool(self.cfg.performance_profile),
             )
+
+        if self.cfg.feature_lighting:
+            from grasp_planning.rl.franka_feature_lighting import install
+
+            install(self)
+
+        self.simplified_background_paths = []
+        if self.cfg.performance_profile:
+            from grasp_planning.rl.franka_performance import simplify_background
+
+            self.simplified_background_paths = simplify_background(self.sim.stage, self.scene.env_prim_paths)
+
+    def step(self, action):
+        if not self.cfg.performance_profile:
+            return super().step(action)
+        # Same Isaac Lab 2.3 DirectRLEnv transition order; render after ALL
+        # physics and resets, because rewards/dones never consume camera images.
+        # This removes the pre-reset image that would otherwise be discarded.
+        action = action.to(self.device)
+        if self.cfg.action_noise_model:
+            action = self._action_noise_model(action)
+        self._pre_physics_step(action)
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self._apply_action()
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(dt=self.physics_dt)
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        self.reward_buf = self._get_rewards()
+        reset_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_ids):
+            self._reset_idx(reset_ids)
+        if self.cfg.events and "interval" in self.event_manager.available_modes:
+            self.event_manager.apply(mode="interval", dt=self.step_dt)
+        if self.sim.has_gui() or self.sim.has_rtx_sensors():
+            renders = self.cfg.num_rerenders_on_reset if len(reset_ids) else 1
+            for _ in range(renders):
+                self.sim.render()
+        self.obs_buf = self._get_observations()
+        if self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     def contract(self):
         result = {
@@ -333,6 +436,12 @@ class FrankaZedEnv(DirectRLEnv):
             "gripper_open_width_m": self.cfg.gripper_open_width_m,
             "tcp_offset_in_hand_m": self.camera_profile["tcp_offset_in_hand_m"],
         }
+        if self.cfg.camera_profile_data is not None:
+            result["camera_profile_data"] = self.camera_profile
+        if self.cfg.feature_lighting:
+            result["feature_lighting"] = self.cfg.feature_lighting
+        if self.cfg.performance_profile:
+            result["performance_profile"] = self.cfg.performance_profile
         if self.lab_contract:
             result["scene_profile"] += "+video_lab_v1"
             result["lab_scene"] = self.lab_contract
@@ -341,7 +450,40 @@ class FrankaZedEnv(DirectRLEnv):
         if self.cfg.object_assets:
             result["object_assets"] = self.cfg.object_assets
             result["multipart_assignment"] = "fixed_geometry_per_environment_v1"
+        if self.cfg.placement_randomization:
+            result["placement_randomization"] = self.cfg.placement_randomization
+        if self.cfg.depth_source != "legacy_image_plane":
+            result["depth_source"] = self.cfg.depth_source
+            result["rgbd_packing"] = "dense_depth_channel_v2"
+        if self.cfg.goal_randomization:
+            result["goal_randomization"] = self.cfg.goal_randomization
+        if self.cfg.symmetry_training:
+            result["symmetry_training"] = {
+                "profile": "franka_object_symmetry_v2",
+                "objective": self.cfg.symmetry_objective,
+                "assets": getattr(self, "symmetry_training_assets", {}),
+                "ready_position_m": self.cfg.ready_position_m,
+                "ready_rotation_rad": self.cfg.ready_rotation_rad,
+            }
+        if self.cfg.symmetry_training and self.cfg.symmetry_objective == "orbit_potential_pose_set_v2":
+            result["symmetry_training"].update(
+                dense_potential="max_weighted_progress_precision_v2",
+                auxiliary_loss="minimum_pose_set_huber_geodesic_v2",
+                auxiliary_descriptor="local_tcp7_goal7_camera9_orbit1_v1",
+                axial_solver={"intervals": 64, "iterations": 24, "method": "all_interval_golden_v1"},
+            )
+        if self.cfg.training_recipe:
+            result["training_recipe"] = self.cfg.training_recipe
+            result["pose_reset_profile"] = self.cfg.pose_reset_profile
         return result
+
+    def _sample_goal_images(self, env_ids, target):
+        if self.goal_variants is None:
+            self.goal_rgbd[env_ids] = self.catalog["goal_rgbd"][target]
+            return
+        images, indices = self.goal_variants.sample(target, self.catalog["goal_rgbd"], self.cfg.goal_variant_index)
+        self.goal_rgbd[env_ids] = images
+        self.goal_variant_indices[env_ids] = indices
 
     def _load_catalog(self):
         path = Path(self.cfg.catalog_path)
@@ -349,12 +491,21 @@ class FrankaZedEnv(DirectRLEnv):
             raise FileNotFoundError(f"Build the Franka catalog first: {path}")
         with np.load(path, allow_pickle=False) as src:
             data = {k: src[k].copy() for k in src.files}
-        if json.loads(str(data["contract_json"].item())) != self.contract():
+        catalog_contract = self.contract().copy()
+        # Catalog geometry/images predate the opt-in objective; checkpoint
+        # contracts below still require the exact training objective on resume.
+        catalog_contract.pop("symmetry_training", None)
+        if json.loads(str(data["contract_json"].item())) != catalog_contract:
             raise ValueError("Franka catalog robot/camera/scene contract mismatch; rebuild it")
         count = len(data["target_ids"])
         if data["joint_paths"].shape[0] != count or data["joint_paths"].shape[-1] != 7:
             raise ValueError("Invalid Franka reset paths")
-        if data["goal_rgbd"].shape != (count, 72, 128, 4):
+        if data["goal_rgbd"].shape != (
+            count,
+            self.camera_profile["observation_height"],
+            self.camera_profile["observation_width"],
+            4,
+        ):
             raise ValueError("Invalid Franka goal RGB-D")
         for key in ("joint_paths", "goal_rgbd", "goal_poses", "object_poses"):
             if not np.isfinite(data[key]).all():
@@ -382,6 +533,33 @@ class FrankaZedEnv(DirectRLEnv):
             key: torch.as_tensor(data[key][selected], device=self.device, dtype=torch.float32)
             for key in ("joint_paths", "goal_rgbd", "goal_poses", "object_poses")
         }
+        self.symmetry_evaluator = None
+        self.symmetry_report = None
+        if self.cfg.symmetry_evaluation or self.cfg.symmetry_training:
+            if self.cfg.dynamic_object or (self.cfg.symmetry_evaluation and not self.cfg.pose_evaluation):
+                raise ValueError("Symmetry requires static objects; symmetry_evaluation also requires pose_evaluation")
+            from grasp_planning.rl.franka_symmetry import SymmetryEvaluator, catalog_symmetries
+
+            orbits, self.symmetry_report = catalog_symmetries(data, selected)
+            if self.cfg.symmetry_training:
+                assemblies = sorted({str(key).split("__part_")[0] for key in data["part_keys"]})
+                paths = [REPO_ROOT / "assets/obj/fabrica" / a / "symmetries.json" for a in assemblies]
+                paths.append(REPO_ROOT / "assets/obj/fabrica/continuous_symmetries.json")
+                self.symmetry_training_assets = {str(path.relative_to(REPO_ROOT)): sha256_file(path) for path in paths}
+            self.symmetry_aux_config = (
+                {
+                    "orbits": [o.tolist() for o in orbits],
+                    "continuous": [r["continuous"] for r in self.symmetry_report["targets"]],
+                    "rotation_scale": self.recipe["auxiliary_rotation_scale_rad"]
+                    if hasattr(self, "recipe")
+                    else self.cfg.training_recipe["source_settings"]["auxiliary_rotation_scale_rad"],
+                }
+                if self.cfg.symmetry_training and self.cfg.symmetry_objective == "orbit_potential_pose_set_v2"
+                else None
+            )
+            self.symmetry_evaluator = SymmetryEvaluator(
+                orbits, self.device, continuous=[r["continuous"] for r in self.symmetry_report["targets"]]
+            )
         self.catalog["open_widths"] = torch.as_tensor(
             data.get("open_widths", np.full(count, self.cfg.gripper_open_width_m))[selected],
             device=self.device,
@@ -390,8 +568,19 @@ class FrankaZedEnv(DirectRLEnv):
         self.catalog["jaw_widths"] = torch.as_tensor(
             data.get("jaw_widths", np.full(count, 0.04))[selected], device=self.device, dtype=torch.float32
         )
-        self.goal_rgbd = torch.zeros((self.num_envs, 72, 128, 4), device=self.device)
+        self.goal_variants = None
+        self.goal_variant_indices = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        if self.cfg.goal_randomization:
+            from grasp_planning.rl.franka_goal_variants import GoalVariantBank
+
+            self.goal_variants = GoalVariantBank(data, selected, self.cfg.goal_randomization, self.device)
+        self.goal_rgbd = torch.zeros(
+            (self.num_envs, self.camera_profile["observation_height"], self.camera_profile["observation_width"], 4),
+            device=self.device,
+        )
         self.goal_pose = torch.zeros((self.num_envs, 7), device=self.device)
+        if self.cfg.training_recipe:
+            self._init_pose_recipe(data, selected)
 
     def tcp_pose(self):
         quat = self.robot.data.body_quat_w[:, self.hand_id]
@@ -409,9 +598,44 @@ class FrankaZedEnv(DirectRLEnv):
         jac = torch.cat((rotation @ jac[:, :3], rotation @ jac[:, 3:]), dim=1)
         return offset_jacobian(jac, quat_apply(self.robot.data.body_quat_w[:, self.hand_id], self.tcp_offset))
 
+    def symmetry_potential(self):
+        from grasp_planning.rl.franka_symmetry_objective import orbit_potential
+
+        pos, quat = self.tcp_pose()
+        return orbit_potential(
+            self.symmetry_evaluator, torch.cat((pos, quat), -1), self.goal_pose, self.target_index, self.recipe
+        )
+
     def pose_errors(self):
         pos, quat = self.tcp_pose()
-        return compute_pose_error(pos, quat, self.goal_pose[:, :3], self.goal_pose[:, 3:], rot_error_type="axis_angle")
+        goal = self.goal_pose
+        if self.cfg.symmetry_training:
+            # A single equivalent TCP supplies translation AND rotation, including
+            # off-centre displacement. Keep rendered goal images unchanged.
+            *_, goal = self.symmetry_evaluator.evaluate(
+                torch.cat((pos, quat), -1),
+                goal,
+                self.target_index,
+                self.cfg.ready_position_m,
+                self.cfg.ready_rotation_rad,
+                return_goal=True,
+            )
+        return compute_pose_error(pos, quat, goal[:, :3], goal[:, 3:], rot_error_type="axis_angle")
+
+    def evaluation_error_norms(self):
+        """Display/scoring distances; leave the policy's nominal pose errors intact."""
+        if self.cfg.symmetry_evaluation and self.cfg.pose_evaluation:
+            pos, quat = self.tcp_pose()
+            p, r, _, _ = self.symmetry_evaluator.evaluate(
+                torch.cat((pos, quat), -1),
+                self.goal_pose,
+                self.target_index,
+                self.cfg.ready_position_m,
+                self.cfg.ready_rotation_rad,
+            )
+            return p, r
+        p, r = self.pose_errors()
+        return p.norm(dim=-1), r.norm(dim=-1)
 
     def contact_force(self):
         forces = [
@@ -442,15 +666,26 @@ class FrankaZedEnv(DirectRLEnv):
     def rgbd(self):
         output = self.wrist_camera.data.output
         p = self.camera_profile
+        if self.cfg.depth_source == "radial_to_optical_z_v1":
+            from grasp_planning.rl.zed_mini import optical_depth_from_radial
+
+            metric_depth = optical_depth_from_radial(
+                output["distance_to_camera"], self.wrist_camera.data.intrinsic_matrices
+            )
+        else:
+            metric_depth = output["distance_to_image_plane"]
         rgb, depth = reproject_intrinsics(
             output["rgb"],
-            output["distance_to_image_plane"],
+            metric_depth,
             self.wrist_camera.data.intrinsic_matrices,
             scaled_intrinsics(p, p["render_width"], p["render_height"]),
         )
-        return pack_zed_rgbd(rgb, depth, p)[0]
+        return pack_zed_rgbd(rgb, depth, p, legacy_batch_layout=self.cfg.depth_source == "legacy_image_plane")[0]
 
     def _pre_physics_step(self, actions):
+        if self.cfg.training_recipe:
+            self._pose_actions(torch.nan_to_num(actions))
+            return
         self.actions = torch.nan_to_num(actions.clone()).clamp(-1, 1)
         self.actions[:, 6] = self.actions[:, 6].clamp(0, 1)
 
@@ -481,15 +716,45 @@ class FrankaZedEnv(DirectRLEnv):
     def _get_dones(self):
         p, r = self.pose_errors()
         pn, rn = p.norm(dim=-1), r.norm(dim=-1)
-        declared = self.actions[:, 6] >= 0.5
+        declared = self.completion_declaration if self.cfg.training_recipe else self.actions[:, 6] >= 0.5
         collision = self.contact_force() >= self.cfg.unsafe_contact_force_n
         ready = self._labels(pn, rn).ready
-        divergence = (pn > 0.20) | (rn > 1.2) | ~torch.isfinite(pn + rn)
+        divergence = (pn > (0.18 if self.cfg.training_recipe else 0.20)) | (rn > 1.2) | ~torch.isfinite(pn + rn)
+        symmetry_diagnostics = {}
+        if self.cfg.symmetry_evaluation and self.cfg.pose_evaluation:
+            pos, quat = self.tcp_pose()
+            tcp = torch.cat((pos, quat), -1)
+            symmetry_diagnostics = {
+                "nominal_position_error_m": pn.clone(),
+                "nominal_rotation_error_rad": rn.clone(),
+                "nominal_success": (declared & ready).clone(),
+            }
+            pn, rn, representative, ready = self.symmetry_evaluator.evaluate(
+                tcp, self.goal_pose, self.target_index, self.cfg.ready_position_m, self.cfg.ready_rotation_rad
+            )
+            ready &= ~collision
+            # An equivalent valid goal must not trigger nominal-pose divergence.
+            limit = 0.18 if self.cfg.training_recipe else 0.20
+            divergence = ~self.symmetry_evaluator.evaluate(tcp, self.goal_pose, self.target_index, limit, 1.2)[-1]
+            symmetry_diagnostics["symmetry_representative"] = representative.clone()
+            # Keep complete poses so later tolerance checks can select their own
+            # paired representative instead of reusing a strict-tolerance minimum.
+            for column, name in enumerate(("x", "y", "z", "qw", "qx", "qy", "qz")):
+                symmetry_diagnostics["tcp_" + name] = tcp[:, column].clone()
+                symmetry_diagnostics["goal_" + name] = self.goal_pose[:, column].clone()
+        if self.cfg.symmetry_training:
+            pos, quat = self.tcp_pose()
+            limit = 0.18 if self.cfg.training_recipe else 0.20
+            divergence = ~self.symmetry_evaluator.evaluate(
+                torch.cat((pos, quat), -1), self.goal_pose, self.target_index, limit, 1.2
+            )[-1]
         self.terminal_success = declared & ready
         self.terminal_collision = collision
         self.terminal_premature = declared & ~ready
         self.terminal_divergence = divergence
-        timeout = self.episode_length_buf >= self.max_episode_length - 1
+        timeout = self.episode_length_buf >= (
+            self.pose_timeout_steps - 1 if self.cfg.training_recipe else self.max_episode_length - 1
+        )
         self.last_transition = {
             "position_error_m": pn.clone(),
             "rotation_error_rad": rn.clone(),
@@ -498,7 +763,16 @@ class FrankaZedEnv(DirectRLEnv):
             "premature": self.terminal_premature.clone(),
             "divergence": divergence.clone(),
             "timeout": timeout.clone(),
+            **symmetry_diagnostics,
         }
+        if self.cfg.training_recipe:
+            self.last_transition.update(
+                initial_position_error_m=self.initial_position_error.clone(),
+                initial_rotation_error_rad=self.initial_rotation_error.clone(),
+                reset_progress=self.reset_progress.clone(),
+                reset_mode=self.reset_mode.clone(),
+                reset_bank_index=self.reset_bank_index.clone(),
+            )
         for name in ("arm_contact", "hand_contact", "left_finger_contact", "right_finger_contact"):
             self.last_transition[name + "_n"] = self.scene[name].data.net_forces_w.norm(dim=-1).amax(-1).clone()
         return declared | collision | divergence, timeout
@@ -506,6 +780,8 @@ class FrankaZedEnv(DirectRLEnv):
     def _get_rewards(self):
         p, r = self.pose_errors()
         pn, rn = p.norm(dim=-1), r.norm(dim=-1)
+        if self.cfg.training_recipe:
+            return self._pose_reward(pn, rn)
         potential = -10 * pn - rn
         quality = completion_quality(
             pn,
@@ -529,15 +805,32 @@ class FrankaZedEnv(DirectRLEnv):
         rotation = self.camera_rotation().transpose(1, 2)
         pc, rc = (rotation @ p[..., None]).squeeze(-1), (rotation @ r[..., None]).squeeze(-1)
         live = self.rgbd()
+        if self.cfg.training_recipe:
+            live = self._pose_live(live)
         live = torch.cat(((live[..., :3] * self.rgb_gain).clamp(0, 1), live[..., 3:]), -1)
         images = torch.cat((live, self.goal_rgbd), -1).flatten(start_dim=1)
         labels = self._labels(p.norm(dim=-1), r.norm(dim=-1))
+        pose_labels = torch.cat(
+            (pc / 0.10, rc / (self.recipe["auxiliary_rotation_scale_rad"] if self.cfg.training_recipe else 0.5)), -1
+        )
+        if self.cfg.symmetry_training and self.cfg.symmetry_objective == "orbit_potential_pose_set_v2":
+            pos, quat = self.tcp_pose()
+            pose_labels = torch.cat(
+                (
+                    pos - self.scene.env_origins,
+                    quat,
+                    self.goal_pose[:, :3] - self.scene.env_origins,
+                    self.goal_pose[:, 3:],
+                    self.camera_rotation().flatten(1),
+                    (self.target_index / len(self.symmetry_evaluator.valid))[:, None],
+                ),
+                -1,
+            )
         policy = torch.cat(
             (
                 images,
                 self.previous_actions,
-                pc / 0.10,
-                rc / 0.5,
+                pose_labels,
                 labels.ready[:, None].float(),
                 labels.supervised[:, None].float(),
             ),
@@ -574,6 +867,9 @@ class FrankaZedEnv(DirectRLEnv):
             if self._multipart_assignment is not None:
                 raise ValueError("Global fixed target override is incompatible with fixed multipart geometry")
             target[:] = self.cfg.fixed_target_index
+        if self.cfg.training_recipe:
+            self._pose_reset(env_ids, target)
+            return
         paths = self.catalog["joint_paths"]
         waypoint = torch.randint(paths.shape[1] - 1, (n,), device=self.device)
         waypoint[torch.rand(n, device=self.device) < self.cfg.reset_ready_fraction] = paths.shape[1] - 1
@@ -582,7 +878,7 @@ class FrankaZedEnv(DirectRLEnv):
         self.target_index[env_ids] = target
         self.goal_pose[env_ids] = self.catalog["goal_poses"][target]
         self.goal_pose[env_ids, :3] += self.scene.env_origins[env_ids]
-        self.goal_rgbd[env_ids] = self.catalog["goal_rgbd"][target]
+        self._sample_goal_images(env_ids, target)
         self.write_state(
             paths[target, waypoint],
             self.catalog["object_poses"][target],

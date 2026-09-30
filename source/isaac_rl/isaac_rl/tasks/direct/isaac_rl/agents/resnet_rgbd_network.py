@@ -34,7 +34,15 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         self.image_width = int(params.get("image_width", 128))
         self.image_channels = int(params.get("image_channels", 8))
         self.policy_context_size = int(params.get("policy_context_size", 6))
+        self.visual_fusion = params.get("visual_fusion", "enhanced")
+        if self.visual_fusion not in ("enhanced", "paired"):
+            raise ValueError("visual_fusion must be enhanced or paired")
+        self.use_policy_context = bool(params.get("use_policy_context", True))
         self.pose_target_size = int(params.get("pose_target_size", 6))
+        self.symmetry_aux = params.get("symmetry_aux")
+        self._symmetry_evaluator = None
+        if self.symmetry_aux and self.pose_target_size != 24:
+            raise ValueError("Symmetry auxiliary supervision requires 24 privileged values")
         self.completion_target_size = int(params.get("completion_target_size", 2))
         self.motion_action_size = int(params.get("motion_action_size", 6))
         if actions_num != self.motion_action_size + 1:
@@ -92,7 +100,7 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         # Each live/goal feature has 256 RGB + 128 depth channels. Preserve
         # both features and expose signed difference, magnitude, and agreement.
         rgbd_channels = 256 + 128
-        fusion_channels = 5 * rgbd_channels
+        fusion_channels = (2 if self.visual_fusion == "paired" else 5) * rgbd_channels
         self.spatial_fusion = nn.Sequential(
             nn.Conv2d(fusion_channels, 256, kernel_size=1),
             nn.ELU(),
@@ -101,7 +109,7 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         )
         self.policy_trunk = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 5 * 8, 512),
+            nn.Linear(128 * ((self.image_height + 15) // 16) * ((self.image_width + 15) // 16), 512),
             nn.ELU(),
             nn.Linear(512, 256),
             nn.ELU(),
@@ -113,7 +121,7 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         )
         shared_feature_size = 256 + geometry_feature_size
         self.motion_head = nn.Sequential(
-            nn.Linear(shared_feature_size + self.policy_context_size, 256),
+            nn.Linear(shared_feature_size + (self.policy_context_size if self.use_policy_context else 0), 256),
             nn.ELU(),
             nn.Linear(256, self.motion_action_size),
         )
@@ -121,7 +129,7 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         self.pose_head = nn.Sequential(
             nn.Linear(geometry_feature_size, 128),
             nn.ELU(),
-            nn.Linear(128, self.pose_target_size),
+            nn.Linear(128, 6 if self.symmetry_aux else self.pose_target_size),
         )
         self.completion_head = nn.Sequential(
             nn.Linear(shared_feature_size, 128),
@@ -157,7 +165,7 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
             self.value,
         ):
             for layer in module.modules():
-                if isinstance(layer, (nn.Conv2d, nn.Linear)):
+                if isinstance(layer, nn.Conv2d | nn.Linear):
                     nn.init.orthogonal_(layer.weight, gain=2**0.5)
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
@@ -215,8 +223,11 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
 
         live = torch.cat((live_rgb_features, live_depth_features), dim=1)
         goal = torch.cat((goal_rgb_features, goal_depth_features), dim=1)
-        difference = live - goal
-        fused = torch.cat((live, goal, difference, difference.abs(), live * goal), dim=1)
+        if self.visual_fusion == "paired":
+            fused = torch.cat((live, goal), dim=1)
+        else:
+            difference = live - goal
+            fused = torch.cat((live, goal, difference, difference.abs(), live * goal), dim=1)
         return self.policy_trunk(self.spatial_fusion(fused))
 
     def forward(self, obs_dict: dict):
@@ -244,7 +255,9 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         # Bound the Gaussian mean before RL-Games samples from it. The
         # environment still clips sampled exploration actions, but latent
         # drift can no longer make the raw mean (and bounds loss) explode.
-        motion_input = torch.cat((shared_features, policy_context), dim=-1)
+        motion_input = (
+            torch.cat((shared_features, policy_context), dim=-1) if self.use_policy_context else shared_features
+        )
         mu = torch.tanh(self.motion_head(motion_input)) * motion_scale
         logstd = mu * 0.0 + self.sigma + torch.log(motion_scale.clamp_min(1.0e-4))
         value = self.value(latent)
@@ -253,11 +266,38 @@ class GraspRgbdResNetNetwork(NetworkBuilder.BaseNetwork):
         if obs_dict.get("is_train", True):
             policy_train_mask = (completion_target[:, 1] >= 0.0).to(dtype=pose_prediction.dtype)
             active_count = policy_train_mask.sum().clamp_min(1.0)
-            position_loss = F.smooth_l1_loss(pose_prediction[:, :3], pose_target[:, :3], reduction="none").mean(dim=-1)
-            rotation_loss = F.smooth_l1_loss(pose_prediction[:, 3:], pose_target[:, 3:], reduction="none").mean(dim=-1)
-            position_loss = (position_loss * policy_train_mask).sum() / active_count
-            rotation_loss = (rotation_loss * policy_train_mask).sum() / active_count
-            self.aux_loss_map["pose_aux_loss"] = self.pose_loss_weight * (position_loss + rotation_loss)
+            if self.symmetry_aux:
+                from grasp_planning.rl.franka_symmetry import SymmetryEvaluator
+                from grasp_planning.rl.franka_symmetry_objective import pose_set_loss
+
+                if self._symmetry_evaluator is None or self._symmetry_evaluator.positions.device != observation.device:
+                    import numpy as np
+
+                    self._symmetry_evaluator = SymmetryEvaluator(
+                        [np.asarray(o) for o in self.symmetry_aux["orbits"]],
+                        observation.device,
+                        continuous=self.symmetry_aux["continuous"],
+                    )
+                with torch.autocast(device_type=observation.device.type, enabled=False):
+                    loss = pose_set_loss(
+                        pose_prediction.float(),
+                        pose_target.float(),
+                        self._symmetry_evaluator,
+                        self.symmetry_aux["rotation_scale"],
+                    )
+                self.aux_loss_map["pose_aux_loss"] = (
+                    self.pose_loss_weight * (loss * policy_train_mask).sum() / active_count
+                )
+            else:
+                position_loss = F.smooth_l1_loss(pose_prediction[:, :3], pose_target[:, :3], reduction="none").mean(
+                    dim=-1
+                )
+                rotation_loss = F.smooth_l1_loss(pose_prediction[:, 3:], pose_target[:, 3:], reduction="none").mean(
+                    dim=-1
+                )
+                position_loss = (position_loss * policy_train_mask).sum() / active_count
+                rotation_loss = (rotation_loss * policy_train_mask).sum() / active_count
+                self.aux_loss_map["pose_aux_loss"] = self.pose_loss_weight * (position_loss + rotation_loss)
             completion_label = completion_target[:, 0]
             completion_supervised = completion_target[:, 1].clamp(0.0, 1.0)
             completion_loss = F.binary_cross_entropy_with_logits(
